@@ -1,0 +1,90 @@
+# File Index (Media + Documents)
+
+A SQLite-backed catalog of media files (video, audio, images) and documents
+(text, data, Word, spreadsheets, presentations, PDFs) across:
+
+- **Local disk** — `Videos`, `Pictures`, `Music`, `Downloads`, `Documents`, `Desktop`
+- **OneDrive** — the locally synced folder at `~/OneDrive`
+- **Google Drive** — listed remotely via [rclone](https://rclone.org/) (remote name: `gdrive`)
+
+Everything is stored in `media_index.db` next to the script. No third-party Python
+packages required (Python 3.10+ stdlib only). rclone must be installed for the
+Google Drive source.
+
+## Usage
+
+```powershell
+# Rebuild the index (all sources)
+python media_index.py scan
+
+# Scan only specific sources
+python media_index.py scan local onedrive
+python media_index.py scan gdrive
+
+# Search by filename
+python media_index.py search vacation
+python media_index.py search ".heic" --kind image --source onedrive --limit 20
+python media_index.py search "." --category photo     # camera photos only
+python media_index.py search "." --category graphic   # computer images only
+
+# Summary of what's indexed
+python media_index.py stats
+
+# Browse and query in your browser
+python webui.py            # then open http://localhost:8765
+python webui.py --port 9000
+```
+
+## Pages
+
+- `/` — landing hub with live stats for both indexes
+- `/media` — Media Index (video, audio, photos vs computer images)
+- `/documents` — Documents Index (text: txt/md/rtf/log, data: json/xml/yaml/csv,
+  Word: doc/docx/odt, spreadsheets: xls/xlsx/xlsm/ods, presentations: ppt/pptx/odp,
+  and PDF). Same search, faceted filters, preview, and rename features as Media;
+  text/data files preview inline and PDFs render in an embedded viewer.
+
+Noise directories (`node_modules`, `.git`, `venv`, build output, ...) are skipped
+during scans.
+
+## Web UI
+
+`webui.py` serves a local, dependency-free web interface on top of the same
+database: live filename/path search, filters by type (including Photos vs
+Computer images), source, and year, sortable results, and per-source stats.
+Filters are faceted: every dropdown shows live match counts given the other
+active filters, and options with no matches are greyed out.
+
+Click any row to open the detail panel:
+
+- **Preview** — images, videos, and audio render inline (local files stream with
+  HTTP range support so videos are seekable; Google Drive files stream through
+  rclone). Formats the browser can't render (HEIC, RAW, MKV, ...) show details only.
+  Note: previewing a cloud-only OneDrive file makes OneDrive download it.
+- **Rename** — works on all three sources (local/OneDrive renames on disk,
+  Google Drive renames via rclone) and updates the index immediately. Suggested
+  names are generated from the EXIF date taken and camera model (when available),
+  the file's photo/graphic/video/audio type, and its folder context. It binds to `127.0.0.1` only, so nothing is
+exposed to your network. Keep the terminal running while you use it; Ctrl+C stops it.
+
+## How it works
+
+- Local/OneDrive scans walk the filesystem with `os.scandir` (attribute-only, so
+  OneDrive cloud-only placeholder files are indexed without downloading them).
+- Google Drive is listed with `rclone lsjson -R --files-only --fast-list gdrive:`
+  using a read-only OAuth scope.
+- Every image is auto-classified as a **photo** (camera shot) or **graphic**
+  (computer-generated image) using camera raw/HEIC extensions, camera filename
+  conventions (`IMG_`, `DSC`, `PXL_`, timestamps, WhatsApp names), screenshot and
+  asset folder/name patterns, and - for ambiguous local JPEGs - a built-in EXIF
+  check for camera Make/Model tags. Cloud-only OneDrive placeholders are never
+  downloaded for the EXIF check; classification is heuristic, so stripped-EXIF
+  photos may land in "graphic".
+- Each `scan` fully replaces that source's rows, so the index always reflects the
+  latest scan. Scan history is kept in the `scans` table.
+
+## Database schema
+
+`files(source, path, name, ext, kind, size, modified, scanned_at)` with indexes on
+`name`, `kind`, and `source`. Query it directly with any SQLite client if you want
+more than the built-in search.
