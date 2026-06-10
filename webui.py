@@ -153,6 +153,7 @@ APP_HTML = """<!DOCTYPE html>
       <option value="onedrive">OneDrive</option>
       <option value="gdrive">Google Drive</option>
     </select>
+    <select id="machine"></select>
     <select id="year"><option value="">Any year</option></select>
     <select id="sort">
       <option value="modified">Newest first</option>
@@ -165,7 +166,7 @@ APP_HTML = """<!DOCTYPE html>
     <div class="results">
       <table>
         <thead><tr>
-          <th>Name</th><th>Type</th><th>Source</th><th>Size</th><th>Modified</th><th>Path</th>
+          <th>Name</th><th>Type</th><th>Source</th><th>Machine</th><th>Size</th><th>Modified</th><th>Path</th>
         </tr></thead>
         <tbody id="rows"></tbody>
       </table>
@@ -239,7 +240,7 @@ function setOptions(sel, opts) {
 async function updateFacets() {
   const p = new URLSearchParams({
     domain: PAGE.domain, q: $("q").value, kind: $("kind").value,
-    source: $("source").value, year: $("year").value,
+    source: $("source").value, machine: $("machine").value, year: $("year").value,
   });
   const f = await (await fetch("/api/facets?" + p)).json();
   setOptions($("kind"), KIND_OPTS.map(([v, l]) => ({
@@ -251,6 +252,11 @@ async function updateFacets() {
   setOptions($("source"), SOURCE_OPTS.map(([v, l]) => ({
     value: v, label: l, count: v ? (f.sources[v] || 0) : null,
   })));
+  const curMachine = $("machine").value;
+  const devices = f.devices || [];
+  if (curMachine && !devices.some(d => d.value === curMachine))
+    devices.unshift({value: curMachine, label: curMachine, count: 0});
+  setOptions($("machine"), [{value: "", label: "All machines", count: null}, ...devices]);
   const curYear = $("year").value;
   const years = f.years.map(y => ({value: y.value, label: y.value, count: y.count}));
   if (curYear && !f.years.some(y => y.value === curYear))
@@ -261,7 +267,8 @@ async function updateFacets() {
 async function search() {
   const p = new URLSearchParams({
     domain: PAGE.domain, q: $("q").value, kind: $("kind").value,
-    source: $("source").value, year: $("year").value, sort: $("sort").value, page,
+    source: $("source").value, machine: $("machine").value,
+    year: $("year").value, sort: $("sort").value, page,
   });
   const d = await (await fetch("/api/search?" + p)).json();
   total = d.total;
@@ -271,11 +278,12 @@ async function search() {
       <td>${esc(r.name)}</td>
       <td><span class="badge ${r.category || r.kind}">${r.category || r.kind}</span></td>
       <td class="src">${esc(r.source)}</td>
+      <td class="src">${esc(r.device_label || "-")}</td>
       <td>${fmtSize(r.size)}</td>
       <td class="src">${r.modified ? esc(r.modified.slice(0,10)) : ""}</td>
       <td class="path">${esc(r.path)}</td>
     </tr>`).join("")
-    : `<tr><td colspan="6" class="empty">No matches</td></tr>`;
+    : `<tr><td colspan="7" class="empty">No matches</td></tr>`;
   const pages = Math.max(1, Math.ceil(total / d.page_size));
   $("pageinfo").textContent =
     `${total.toLocaleString()} result(s) \u00b7 page ${page + 1} of ${pages}`;
@@ -311,7 +319,7 @@ async function openPanel(r) {
   }
   $("fmeta").innerHTML =
     `<b>${esc(r.category || r.kind)}</b> \u00b7 ${fmtSize(r.size)} \u00b7 ` +
-    `${r.modified ? esc(r.modified.slice(0,10)) : "no date"} \u00b7 ${esc(r.source)}<br>` +
+    `${r.modified ? esc(r.modified.slice(0,10)) : "no date"} \u00b7 ${esc(r.source)} \u00b7 ${esc(r.device_label || "-")}<br>` +
     `${esc(r.path)}`;
   $("newname").value = r.name;
   $("renamemsg").textContent = "";
@@ -373,7 +381,7 @@ $("q").addEventListener("input", () => {
   clearTimeout(t);
   t = setTimeout(() => { page = 0; closePanel(); search(); updateFacets(); }, 250);
 });
-for (const id of ["kind","source","year"])
+for (const id of ["kind","source","machine","year"])
   $(id).addEventListener("change", () => { page = 0; closePanel(); search(); updateFacets(); });
 $("sort").addEventListener("change", () => { page = 0; search(); });
 $("prev").onclick = () => { page--; search(); };
@@ -381,6 +389,7 @@ $("next").onclick = () => { page++; search(); };
 
 setOptions($("kind"), KIND_OPTS.map(([v, l]) => ({value: v, label: l, count: null})));
 setOptions($("source"), SOURCE_OPTS.map(([v, l]) => ({value: v, label: l, count: null})));
+setOptions($("machine"), [{value: "", label: "All machines", count: null}]);
 loadStats();
 updateFacets();
 search();
@@ -546,6 +555,7 @@ def _build_where(params, exclude: str | None = None):
     q = params.get("q", [""])[0].strip()
     kind = params.get("kind", [""])[0]
     source = params.get("source", [""])[0]
+    machine = params.get("machine", [""])[0]
     year = params.get("year", [""])[0]
     if q:
         where.append("(name LIKE ? OR path LIKE ?)")
@@ -560,6 +570,9 @@ def _build_where(params, exclude: str | None = None):
     if exclude != "source" and source in ("local", "onedrive", "gdrive"):
         where.append("source = ?")
         args.append(source)
+    if exclude != "machine" and machine:
+        where.append("device_id = ?")
+        args.append(machine)
     if exclude != "year" and year.isdigit() and len(year) == 4:
         where.append("substr(modified,1,4) = ?")
         args.append(year)
@@ -578,13 +591,18 @@ def api_facets(params):
     cond, args = _build_where(params, exclude="source")
     sources = dict(conn.execute(
         f"SELECT source, COUNT(*) FROM files WHERE {cond} GROUP BY source", args))
+    cond, args = _build_where(params, exclude="machine")
+    devices = [{"value": r[0], "label": r[1] or "Unknown machine", "count": r[2]}
+               for r in conn.execute(
+        f"SELECT device_id, device_label, COUNT(*) FROM files "
+        f"WHERE {cond} GROUP BY device_id, device_label ORDER BY device_label", args)]
     cond, args = _build_where(params, exclude="year")
     years = [{"value": r[0], "count": r[1]} for r in conn.execute(
         f"SELECT substr(modified,1,4) y, COUNT(*) FROM files "
         f"WHERE {cond} AND modified != '' GROUP BY y ORDER BY y DESC", args)]
     conn.close()
     return {"kinds": kinds, "categories": categories,
-            "sources": sources, "years": years}
+            "sources": sources, "devices": devices, "years": years}
 
 
 def api_search(params):
@@ -598,7 +616,7 @@ def api_search(params):
     conn = db()
     total = conn.execute(f"SELECT COUNT(*) FROM files WHERE {cond}", args).fetchone()[0]
     rows = [dict(r) for r in conn.execute(
-        f"SELECT id, source, path, name, ext, kind, size, modified, category "
+        f"SELECT id, source, device_id, device_label, path, name, ext, kind, size, modified, category "
         f"FROM files WHERE {cond} ORDER BY {sort} LIMIT ? OFFSET ?",
         args + [PAGE_SIZE, page * PAGE_SIZE])]
     conn.close()

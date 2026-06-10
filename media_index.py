@@ -8,10 +8,12 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -108,6 +110,49 @@ GRAPHIC_PATH_RE = re.compile(
 
 # Windows Files On-Demand placeholder: reading content would trigger a download.
 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+
+
+def get_machine_identity() -> tuple[str, str]:
+    """Stable ID + human label for this machine's local C: scan context."""
+    host = socket.gethostname()
+    machine_guid = ""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as key:
+            machine_guid = winreg.QueryValueEx(key, "MachineGuid")[0]
+    except Exception:
+        machine_guid = ""
+
+    serial = "unknown"
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            vol_name = ctypes.create_unicode_buffer(261)
+            fs_name = ctypes.create_unicode_buffer(261)
+            serial_num = ctypes.c_ulong(0)
+            max_comp = ctypes.c_ulong(0)
+            flags = ctypes.c_ulong(0)
+            ok = kernel32.GetVolumeInformationW(
+                ctypes.c_wchar_p("C:\\"),
+                vol_name,
+                261,
+                ctypes.byref(serial_num),
+                ctypes.byref(max_comp),
+                ctypes.byref(flags),
+                fs_name,
+                261,
+            )
+            if ok:
+                serial = f"{serial_num.value:08X}"
+        except Exception:
+            pass
+
+    raw = f"{host}|{machine_guid}|{serial}"
+    digest = hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()[:12]
+    machine_id = f"pc-{digest}"
+    machine_label = f"{host} (C:{serial})"
+    return machine_id, machine_label
 
 
 def _parse_tiff_exif(tiff: bytes) -> dict:
@@ -232,9 +277,11 @@ CREATE TABLE IF NOT EXISTS files (
     kind TEXT NOT NULL,              -- 'video' | 'audio' | 'image'
     size INTEGER,
     modified TEXT,                   -- ISO 8601
-    category TEXT,                   -- images only: 'photo' | 'graphic'
+    category TEXT,                   -- images/documents sub-category
+    device_id TEXT,                  -- identifies scanning machine context
+    device_label TEXT,               -- readable machine label
     scanned_at TEXT NOT NULL,
-    UNIQUE (source, path)
+    UNIQUE (source, device_id, path)
 );
 CREATE INDEX IF NOT EXISTS idx_files_name ON files (name);
 CREATE INDEX IF NOT EXISTS idx_files_kind ON files (kind);
@@ -250,13 +297,66 @@ CREATE TABLE IF NOT EXISTS scans (
 """
 
 
+def _is_legacy_unique(db: sqlite3.Connection) -> bool:
+    for idx in db.execute("PRAGMA index_list(files)"):
+        if not idx[2]:  # unique flag
+            continue
+        cols = [c[2] for c in db.execute(f"PRAGMA index_info({idx[1]!r})")]
+        if cols == ["source", "path"]:
+            return True
+    return False
+
+
+def _migrate_files_table(db: sqlite3.Connection):
+    # Rebuild table so uniqueness includes machine identity.
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS files_new (
+        id INTEGER PRIMARY KEY,
+        source TEXT NOT NULL,
+        path TEXT NOT NULL,
+        name TEXT NOT NULL,
+        ext TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        size INTEGER,
+        modified TEXT,
+        category TEXT,
+        device_id TEXT,
+        device_label TEXT,
+        scanned_at TEXT NOT NULL,
+        UNIQUE (source, device_id, path)
+    );
+    INSERT INTO files_new (
+        id, source, path, name, ext, kind, size, modified, category, device_id, device_label, scanned_at
+    )
+    SELECT
+        id, source, path, name, ext, kind, size, modified, category,
+        CASE WHEN source = 'gdrive' THEN 'gdrive-shared' ELSE 'legacy-machine' END,
+        CASE WHEN source = 'gdrive' THEN 'Google Drive remote' ELSE 'Legacy machine (migrated)' END,
+        scanned_at
+    FROM files;
+    DROP TABLE files;
+    ALTER TABLE files_new RENAME TO files;
+    CREATE INDEX IF NOT EXISTS idx_files_name ON files (name);
+    CREATE INDEX IF NOT EXISTS idx_files_kind ON files (kind);
+    CREATE INDEX IF NOT EXISTS idx_files_source ON files (source);
+    CREATE INDEX IF NOT EXISTS idx_files_device ON files (device_id);
+    """)
+
+
 def get_db() -> sqlite3.Connection:
     db = sqlite3.connect(DB_PATH)
     db.executescript(SCHEMA)
     cols = {row[1] for row in db.execute("PRAGMA table_info(files)")}
-    if "category" not in cols:  # migrate pre-category databases
+    if "category" not in cols:
         db.execute("ALTER TABLE files ADD COLUMN category TEXT")
-        db.commit()
+    if "device_id" not in cols:
+        db.execute("ALTER TABLE files ADD COLUMN device_id TEXT")
+    if "device_label" not in cols:
+        db.execute("ALTER TABLE files ADD COLUMN device_label TEXT")
+    if _is_legacy_unique(db):
+        _migrate_files_table(db)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_files_device ON files (device_id)")
+    db.commit()
     return db
 
 
@@ -318,7 +418,8 @@ def scan_gdrive():
         yield item["Path"], name, ext, kind, item.get("Size", -1), modified, category
 
 
-def run_scan(db: sqlite3.Connection, source: str, row_iter) -> tuple[int, int]:
+def run_scan(db: sqlite3.Connection, source: str, row_iter,
+             device_id: str, device_label: str) -> tuple[int, int]:
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
     scanned_at = started
     rows = []
@@ -327,11 +428,18 @@ def run_scan(db: sqlite3.Connection, source: str, row_iter) -> tuple[int, int]:
     t0 = time.time()
     insert_sql = (
         "INSERT OR REPLACE INTO files "
-        "(source, path, name, ext, kind, size, modified, category, scanned_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-    db.execute("DELETE FROM files WHERE source = ?", (source,))
+        "(source, path, name, ext, kind, size, modified, category, device_id, device_label, scanned_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    if source in ("local", "onedrive"):
+        db.execute(
+            "DELETE FROM files WHERE source = ? "
+            "AND (device_id = ? OR device_id = 'legacy-machine' OR device_id IS NULL)",
+            (source, device_id),
+        )
+    else:
+        db.execute("DELETE FROM files WHERE source = ?", (source,))
     for path, name, ext, kind, size, modified, category in row_iter:
-        rows.append((source, path, name, ext, kind, size, modified, category, scanned_at))
+        rows.append((source, path, name, ext, kind, size, modified, category, device_id, device_label, scanned_at))
         count += 1
         total += max(size, 0)
         if len(rows) >= 5000:
@@ -361,15 +469,20 @@ def fmt_size(n: int) -> str:
 def cmd_scan(args):
     sources = args.sources or ["local", "onedrive", "gdrive"]
     db = get_db()
+    local_device_id, local_device_label = get_machine_identity()
+    gdrive_device_id, gdrive_device_label = "gdrive-shared", "Google Drive remote"
     for source in sources:
         print(f"Scanning {source}...")
         try:
             if source == "local":
-                run_scan(db, "local", walk_filesystem(LOCAL_ROOTS, exclude=ONEDRIVE_ROOT))
+                run_scan(db, "local", walk_filesystem(LOCAL_ROOTS, exclude=ONEDRIVE_ROOT),
+                         local_device_id, local_device_label)
             elif source == "onedrive":
-                run_scan(db, "onedrive", walk_filesystem([ONEDRIVE_ROOT]))
+                run_scan(db, "onedrive", walk_filesystem([ONEDRIVE_ROOT]),
+                         local_device_id, local_device_label)
             elif source == "gdrive":
-                run_scan(db, "gdrive", scan_gdrive())
+                run_scan(db, "gdrive", scan_gdrive(),
+                         gdrive_device_id, gdrive_device_label)
             else:
                 print(f"  unknown source: {source}", file=sys.stderr)
         except Exception as exc:
@@ -379,7 +492,7 @@ def cmd_scan(args):
 
 def cmd_search(args):
     db = get_db()
-    sql = ("SELECT source, kind, category, size, modified, path "
+    sql = ("SELECT source, device_label, kind, category, size, modified, path "
            "FROM files WHERE name LIKE ?")
     params: list = [f"%{args.term}%"]
     if args.kind:
@@ -397,9 +510,10 @@ def cmd_search(args):
     if not results:
         print("No matches.")
         return
-    for source, kind, category, size, modified, path in results:
+    for source, device_label, kind, category, size, modified, path in results:
         label = category or kind
-        print(f"{source:<9} {label:<8} {fmt_size(size or 0):>10}  {modified or '':<20}  {path}")
+        who = (device_label or "-")[:24]
+        print(f"{source:<9} {who:<24} {label:<8} {fmt_size(size or 0):>10}  {modified or '':<20}  {path}")
     print(f"\n{len(results)} result(s)")
 
 
@@ -425,6 +539,13 @@ def cmd_stats(args):
         print("\nImage breakdown:")
         for category, count in cats:
             print(f"  {category or 'unclassified'}: {count:,}")
+    devices = db.execute(
+        "SELECT source, device_label, COUNT(*) FROM files "
+        "GROUP BY source, device_label ORDER BY source, device_label").fetchall()
+    if devices:
+        print("\nIndexed machine contexts:")
+        for source, label, count in devices:
+            print(f"  {source}: {label or 'unknown'} ({count:,} files)")
     last = db.execute(
         "SELECT source, MAX(finished_at) FROM scans GROUP BY source").fetchall()
     print("\nLast scans:")
