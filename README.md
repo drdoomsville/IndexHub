@@ -51,9 +51,9 @@ during scans.
 
 `webui.py` serves a local, dependency-free web interface on top of the same
 database: live filename/path search, filters by type (including Photos vs
-Computer images), source, and year, sortable results, and per-source stats.
-Filters are faceted: every dropdown shows live match counts given the other
-active filters, and options with no matches are greyed out.
+Computer images), source, machine, and year, sortable results, and per-source
+stats. Filters are faceted: every dropdown shows live match counts given the
+other active filters, and options with no matches are greyed out.
 
 Click any row to open the detail panel:
 
@@ -64,8 +64,10 @@ Click any row to open the detail panel:
 - **Rename** — works on all three sources (local/OneDrive renames on disk,
   Google Drive renames via rclone) and updates the index immediately. Suggested
   names are generated from the EXIF date taken and camera model (when available),
-  the file's photo/graphic/video/audio type, and its folder context. It binds to `127.0.0.1` only, so nothing is
-exposed to your network. Keep the terminal running while you use it; Ctrl+C stops it.
+  the file's photo/graphic/video/audio type, and its folder context.
+
+The server binds to `127.0.0.1` only, so nothing is exposed to your network.
+Keep the terminal running while you use it; Ctrl+C stops it.
 
 ## How it works
 
@@ -80,11 +82,27 @@ exposed to your network. Keep the terminal running while you use it; Ctrl+C stop
   check for camera Make/Model tags. Cloud-only OneDrive placeholders are never
   downloaded for the EXIF check; classification is heuristic, so stripped-EXIF
   photos may land in "graphic".
-- Each `scan` fully replaces that source's rows, so the index always reflects the
-  latest scan. Scan history is kept in the `scans` table.
+- Each `scan` fully replaces that source's rows for the scanning machine, so the
+  index always reflects the latest scan. Scan history is kept in the `scans` table.
+
+## Machine identity
+
+Every local/OneDrive row records which machine it was scanned on, so `C:\...`
+paths from different PCs never collide and remain distinguishable:
+
+- `device_id` — stable fingerprint hashed from the hostname, the Windows
+  `MachineGuid`, and the `C:` volume serial number
+- `device_label` — readable form, e.g. `DESKTOP-H13TS5U (C:CB50F0E0)`
+
+Run the same scripts (sharing the same `media_index.db`) on a second machine and
+its files are indexed alongside this one's; the web UI's **Machine** filter and
+column tell them apart. Google Drive rows use a shared `gdrive-shared` identity
+since the remote is machine-independent. Databases created before this feature
+are migrated automatically on first use.
 
 ## Database schema
 
-`files(source, path, name, ext, kind, size, modified, scanned_at)` with indexes on
-`name`, `kind`, and `source`. Query it directly with any SQLite client if you want
-more than the built-in search.
+`files(source, path, name, ext, kind, size, modified, category, device_id,
+device_label, scanned_at)` with `UNIQUE (source, device_id, path)` and indexes on
+`name`, `kind`, `source`, and `device_id`. Query it directly with any SQLite
+client if you want more than the built-in search.
