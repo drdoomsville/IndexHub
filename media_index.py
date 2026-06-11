@@ -556,7 +556,11 @@ def _migrate_files_table(db: sqlite3.Connection):
 
 
 def get_db() -> sqlite3.Connection:
-    db = sqlite3.connect(DB_PATH)
+    # 30s busy timeout: a delete/rename must wait out a scan job's commit
+    # instead of failing with "database is locked". WAL keeps readers from
+    # ever blocking on writers.
+    db = sqlite3.connect(DB_PATH, timeout=30)
+    db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
     cols = {row[1] for row in db.execute("PRAGMA table_info(files)")}
     if "category" not in cols:
@@ -780,10 +784,13 @@ def run_hash_pass(db: sqlite3.Connection, sources: list[str] | None = None,
             if cancel_event is not None and cancel_event.is_set():
                 break
             continue
+        # Commit per file: hashing can take seconds (remote downloads), and
+        # holding a write transaction across iterations starves other
+        # connections (UI deletes/renames) into "database is locked".
         db.execute("UPDATE files SET content_hash = ? WHERE id = ?", (digest, row_id))
+        db.commit()
         done += 1
         if done % 100 == 0:
-            db.commit()
             msg = f"  [hash] {done:,}/{len(rows):,} files hashed..."
             print(msg, flush=True)
             if progress_cb:

@@ -60,9 +60,16 @@ class FileSessionManager:
         if not row:
             raise ValueError("File not found in index")
         entry_id = uuid.uuid4().hex[:12]
-        trash_path = self._move_to_trash(session_id, entry_id, row)
         snapshot = _row_dict(row)
+        # Delete the index row first (uncommitted), move the file second:
+        # if the move fails we roll back and nothing changed; the move is the
+        # step that can't be rolled back, so it must come last.
         db.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        try:
+            trash_path = self._move_to_trash(session_id, entry_id, row)
+        except BaseException:
+            db.rollback()
+            raise
         db.commit()
         entry = {
             "entry_id": entry_id,
@@ -86,15 +93,22 @@ class FileSessionManager:
         entry = self._pop_entry(session_id, entry_id)
         if not entry:
             raise ValueError("Trash entry not found or already restored")
-        self._restore_from_trash(entry)
         snap = entry["snapshot"]
         cols = [k for k in snap if k != "id"]
         placeholders = ", ".join("?" * len(cols))
         col_names = ", ".join(cols)
+        # Same ordering as delete_file: stage the row insert, move the file,
+        # commit only once the move succeeded.
         db.execute(
             f"INSERT OR REPLACE INTO files ({col_names}) VALUES ({placeholders})",
             [snap[c] for c in cols],
         )
+        try:
+            self._restore_from_trash(entry)
+        except BaseException:
+            db.rollback()
+            self._add_entry(session_id, entry)
+            raise
         db.commit()
         return {"ok": True, "file_id": snap["id"], "path": snap["path"], "name": snap["name"]}
 
@@ -105,13 +119,21 @@ class FileSessionManager:
         dest_dir = (dest_dir or "").strip()
         if not dest_dir:
             raise ValueError("Destination folder is required")
-        new_path = self._move_on_disk(row, dest_dir)
+        new_path = self._dest_path(row, dest_dir)
         new_name = Path(new_path).name if row["source"] in ("local", "onedrive") else PurePosixPath(new_path).name
         new_ext = new_name.rsplit(".", 1)[-1].lower() if "." in new_name else row["ext"]
+        # Stage the index update, move on disk, commit only after the move
+        # succeeds — a locked/failed step can no longer leave the file moved
+        # but the index stale (or vice versa).
         db.execute(
             "UPDATE files SET path = ?, name = ?, ext = ?, marked_delete = 0 WHERE id = ?",
             (new_path, new_name, new_ext, file_id),
         )
+        try:
+            self._move_on_disk(row, dest_dir)
+        except BaseException:
+            db.rollback()
+            raise
         db.commit()
         return {"ok": True, "path": new_path, "name": new_name, "ext": new_ext}
 
@@ -163,24 +185,29 @@ class FileSessionManager:
         if proc.returncode != 0:
             raise ValueError(f"Restore failed: {proc.stderr.strip()[:300]}")
 
+    @staticmethod
+    def _dest_path(row: sqlite3.Row, dest_dir: str) -> str:
+        if row["source"] in ("local", "onedrive"):
+            return str(Path(dest_dir) / Path(row["path"]).name)
+        dest_posix = dest_dir.replace("\\", "/").strip("/")
+        name = PurePosixPath(row["path"]).name
+        return f"{dest_posix}/{name}" if dest_posix else name
+
     def _move_on_disk(self, row: sqlite3.Row, dest_dir: str) -> str:
         source = row["source"]
         if source in ("local", "onedrive"):
             src = Path(row["path"])
-            dest_folder = Path(dest_dir)
-            if not dest_folder.is_dir():
+            if not Path(dest_dir).is_dir():
                 raise ValueError("Destination folder does not exist")
-            dest = dest_folder / src.name
+            dest = Path(self._dest_path(row, dest_dir))
             if dest.exists():
                 raise ValueError("A file with that name already exists in the destination")
             shutil.move(str(src), str(dest))
             return str(dest)
-        dest_posix = dest_dir.replace("\\", "/").strip("/")
-        old_rel = row["path"]
-        new_rel = f"{dest_posix}/{PurePosixPath(old_rel).name}" if dest_posix else PurePosixPath(old_rel).name
+        new_rel = self._dest_path(row, dest_dir)
         proc = subprocess.run(
             [mi.find_rclone(), "moveto",
-             mi.rclone_full_path(source, old_rel),
+             mi.rclone_full_path(source, row["path"]),
              mi.rclone_full_path(source, new_rel)],
             capture_output=True, text=True, encoding="utf-8",
         )
