@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Media Index: catalog media files across local disk, OneDrive, and Google Drive.
+"""Media Index: catalog media files across local disk, OneDrive, Google Drive, and QNAP NAS.
 
 Usage:
-  python media_index.py scan [local] [onedrive] [gdrive]   # scan sources (default: all)
+  python media_index.py scan [local] [onedrive] [gdrive] [qnap]   # scan sources (default: all configured)
+  python media_index.py qnap-setup --user NAME --share Public   # save NAS credentials locally
   python media_index.py search <term> [--kind video|audio|image] [--source ...] [--limit N]
   python media_index.py stats
 """
@@ -33,6 +34,8 @@ LOCAL_ROOTS = [
     USER / "Desktop",
 ]
 GDRIVE_REMOTE = "gdrive:"
+QNAP_CONFIG_PATH = Path(__file__).parent / "qnap_config.json"
+QNAP_REMOTE = "qnap:"
 
 
 def find_rclone() -> str:
@@ -44,6 +47,215 @@ def find_rclone() -> str:
     if matches:
         return str(matches[0])
     raise RuntimeError("rclone not found; install it or add it to PATH")
+
+
+def load_qnap_config() -> dict | None:
+    if not QNAP_CONFIG_PATH.is_file():
+        return None
+    cfg = json.loads(QNAP_CONFIG_PATH.read_text(encoding="utf-8"))
+    required = ("host", "user", "pass")
+    if not all(cfg.get(k) for k in required):
+        return None
+    cfg.setdefault("share", "Public")
+    cfg.setdefault("web_url", f"http://{cfg['host']}:8080/")
+    cfg.setdefault("label", "QNAP NAS")
+    return cfg
+
+
+def qnap_configured() -> bool:
+    return load_qnap_config() is not None
+
+
+def qnap_device_identity(cfg: dict) -> tuple[str, str]:
+    host = cfg["host"]
+    digest = hashlib.sha256(host.encode("utf-8")).hexdigest()[:12]
+    label = cfg.get("label") or f"QNAP ({host})"
+    return f"qnap-{digest}", label
+
+
+def ensure_qnap_rclone_remote(cfg: dict):
+    """Create/update the rclone SMB remote used for QNAP scans."""
+    args = [
+        find_rclone(), "config", "create", "qnap", "smb",
+        f"host={cfg['host']}",
+        f"user={cfg['user']}",
+        f"pass={cfg['pass']}",
+        "port=445",
+        "config_is_local=true",
+    ]
+    proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
+    if proc.returncode != 0 and "already exists" not in proc.stderr.lower():
+        # Remote may exist with different settings — recreate it.
+        subprocess.run(
+            [find_rclone(), "config", "delete", "qnap", "config_is_local=true"],
+            capture_output=True, text=True, encoding="utf-8")
+        proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
+        if proc.returncode != 0:
+            raise RuntimeError(f"rclone QNAP setup failed: {proc.stderr.strip()[:500]}")
+
+
+def qnap_scan_root(cfg: dict) -> str:
+    share = (cfg.get("share") or "").strip("/\\")
+    return f"{QNAP_REMOTE}{share}" if share else QNAP_REMOTE
+
+
+def rclone_full_path(source: str, rel_path: str) -> str:
+    """Build a full rclone remote path for gdrive/qnap rows."""
+    if source == "gdrive":
+        return f"{GDRIVE_REMOTE}{rel_path}"
+    if source == "qnap":
+        cfg = load_qnap_config()
+        if not cfg:
+            raise RuntimeError("QNAP not configured")
+        root = qnap_scan_root(cfg)
+        rel = rel_path.lstrip("/\\")
+        return f"{root}/{rel}" if rel else root
+    raise ValueError(f"not a remote source: {source}")
+
+
+def scan_qnap(cancel_event=None, path_prefix: str = ""):
+    """Yield media file rows from QNAP via rclone SMB lsf (streaming)."""
+    cfg = load_qnap_config()
+    if not cfg:
+        raise RuntimeError(
+            "QNAP not configured. Copy qnap_config.example.json to qnap_config.json "
+            "or run: python media_index.py qnap-setup --user YOUR_USER"
+        )
+    ensure_qnap_rclone_remote(cfg)
+    root = qnap_scan_root(cfg)
+    proc = subprocess.Popen(
+        [find_rclone(), "lsf", "-R", "--files-only", "--fast-list",
+         "--format", "tsp", "--separator", "|",
+         "--filter", "- @Recently-Snapshot/**", root],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+    )
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            line = line.rstrip("\r\n")
+            if not line or "|" not in line:
+                continue
+            modified, size_str, path = line.split("|", 2)
+            if not _path_matches_prefix(path, path_prefix):
+                continue
+            name = path.rsplit("/", 1)[-1]
+            kind = classify(name)
+            if kind is None:
+                continue
+            ext = name.rsplit(".", 1)[-1].lower()
+            try:
+                size = int(size_str)
+            except ValueError:
+                size = -1
+            category = categorize(path, name, ext, kind, readable=False)
+            yield path, name, ext, kind, size, modified, category
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    rc = proc.returncode
+    if rc not in (0, None, -15, 1) and not (cancel_event and cancel_event.is_set()):
+        print(f"  [qnap] warning: rclone exited with code {rc}", file=sys.stderr)
+
+
+HASH_CHUNK = 1024 * 1024
+
+
+def compute_meta_fingerprint(size: int, modified: str, name: str, ext: str, kind: str) -> str:
+    payload = f"{size}|{modified or ''}|{name.lower()}|{ext}|{kind}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def hash_local_file(path: str, cancel_event=None) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    return None
+                chunk = handle.read(HASH_CHUNK)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def hash_remote_file(source: str, rel_path: str, cancel_event=None) -> str | None:
+    if cancel_event is not None and cancel_event.is_set():
+        return None
+    remote = rclone_full_path(source, rel_path)
+    proc = subprocess.run(
+        [find_rclone(), "hashsum", "SHA256", "--download", remote],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith(";"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2 and len(parts[0]) == 64:
+            return parts[0].lower()
+    return None
+
+
+def hash_file_row(source: str, path: str, cancel_event=None) -> str | None:
+    if source in ("local", "onedrive"):
+        return hash_local_file(path, cancel_event)
+    if source in ("gdrive", "qnap"):
+        return hash_remote_file(source, path, cancel_event)
+    return None
+
+
+def default_sources() -> list[str]:
+    return ["local", "onedrive", "gdrive"] + (["qnap"] if qnap_configured() else [])
+
+
+def _path_matches_prefix(path: str, prefix: str) -> bool:
+    if not prefix:
+        return True
+    norm_path = path.replace("\\", "/")
+    norm_prefix = prefix.replace("\\", "/").strip("/")
+    if not norm_prefix:
+        return True
+    return norm_path == norm_prefix or norm_path.startswith(norm_prefix + "/") or norm_path.startswith(norm_prefix + "\\")
+
+
+def _filter_rows(row_iter, path_prefix: str = "", cancel_event=None):
+    for row in row_iter:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        if _path_matches_prefix(row[0], path_prefix):
+            yield row
+
+
+def cmd_qnap_setup(args):
+    password = args.password
+    if not password:
+        import getpass
+        password = getpass.getpass("QNAP password: ")
+    if not password:
+        raise SystemExit("Password is required.")
+    cfg = {
+        "host": args.host,
+        "web_url": args.web_url,
+        "share": args.share,
+        "user": args.user,
+        "pass": password,
+        "label": args.label,
+    }
+    QNAP_CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    ensure_qnap_rclone_remote(cfg)
+    print(f"Saved {QNAP_CONFIG_PATH}")
+    print(f"Scan with: python media_index.py scan qnap")
+
 
 EXTENSIONS = {
     "video": {
@@ -270,8 +482,8 @@ def categorize(path: str, name: str, ext: str, kind: str, readable: bool) -> str
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY,
-    source TEXT NOT NULL,            -- 'local' | 'onedrive' | 'gdrive'
-    path TEXT NOT NULL,              -- absolute local path or gdrive-relative path
+    source TEXT NOT NULL,            -- 'local' | 'onedrive' | 'gdrive' | 'qnap'
+    path TEXT NOT NULL,              -- absolute local path or remote-relative path
     name TEXT NOT NULL,
     ext TEXT NOT NULL,
     kind TEXT NOT NULL,              -- 'video' | 'audio' | 'image'
@@ -353,9 +565,18 @@ def get_db() -> sqlite3.Connection:
         db.execute("ALTER TABLE files ADD COLUMN device_id TEXT")
     if "device_label" not in cols:
         db.execute("ALTER TABLE files ADD COLUMN device_label TEXT")
+    if "meta_fingerprint" not in cols:
+        db.execute("ALTER TABLE files ADD COLUMN meta_fingerprint TEXT")
+    if "content_hash" not in cols:
+        db.execute("ALTER TABLE files ADD COLUMN content_hash TEXT")
+    if "marked_delete" not in cols:
+        db.execute("ALTER TABLE files ADD COLUMN marked_delete INTEGER NOT NULL DEFAULT 0")
     if _is_legacy_unique(db):
         _migrate_files_table(db)
     db.execute("CREATE INDEX IF NOT EXISTS idx_files_device ON files (device_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_files_meta_fp ON files (meta_fingerprint)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files (content_hash)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_files_name_lower ON files (name COLLATE NOCASE)")
     db.commit()
     return db
 
@@ -365,10 +586,20 @@ def classify(name: str) -> str | None:
     return EXT_TO_KIND.get(ext)
 
 
-def walk_filesystem(roots: list[Path], exclude: Path | None = None):
-    """Yield (path, name, ext, kind, size, modified_iso) for media files."""
-    stack = [r for r in roots if r.is_dir()]
+def walk_filesystem(roots: list[Path], exclude: Path | None = None,
+                    path_prefix: str = "", cancel_event=None):
+    """Yield file rows for media files under roots."""
+    if path_prefix:
+        prefix_path = Path(path_prefix)
+        if prefix_path.is_dir():
+            stack = [prefix_path]
+        else:
+            return
+    else:
+        stack = [r for r in roots if r.is_dir()]
     while stack:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         current = stack.pop()
         try:
             entries = os.scandir(current)
@@ -376,6 +607,8 @@ def walk_filesystem(roots: list[Path], exclude: Path | None = None):
             continue
         with entries:
             for entry in entries:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         if entry.name.lower() in EXCLUDE_DIRS:
@@ -398,7 +631,7 @@ def walk_filesystem(roots: list[Path], exclude: Path | None = None):
                     continue
 
 
-def scan_gdrive():
+def scan_gdrive(path_prefix: str = ""):
     """Yield media file rows from Google Drive via rclone lsjson."""
     proc = subprocess.run(
         [find_rclone(), "lsjson", "-R", "--files-only", "--fast-list",
@@ -408,6 +641,8 @@ def scan_gdrive():
     if proc.returncode != 0:
         raise RuntimeError(f"rclone failed: {proc.stderr.strip()[:500]}")
     for item in json.loads(proc.stdout):
+        if not _path_matches_prefix(item["Path"], path_prefix):
+            continue
         name = item["Name"]
         kind = classify(name)
         if kind is None:
@@ -416,45 +651,6 @@ def scan_gdrive():
         modified = item.get("ModTime", "")
         category = categorize(item["Path"], name, ext, kind, readable=False)
         yield item["Path"], name, ext, kind, item.get("Size", -1), modified, category
-
-
-def run_scan(db: sqlite3.Connection, source: str, row_iter,
-             device_id: str, device_label: str) -> tuple[int, int]:
-    started = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    scanned_at = started
-    rows = []
-    count = 0
-    total = 0
-    t0 = time.time()
-    insert_sql = (
-        "INSERT OR REPLACE INTO files "
-        "(source, path, name, ext, kind, size, modified, category, device_id, device_label, scanned_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-    if source in ("local", "onedrive"):
-        db.execute(
-            "DELETE FROM files WHERE source = ? "
-            "AND (device_id = ? OR device_id = 'legacy-machine' OR device_id IS NULL)",
-            (source, device_id),
-        )
-    else:
-        db.execute("DELETE FROM files WHERE source = ?", (source,))
-    for path, name, ext, kind, size, modified, category in row_iter:
-        rows.append((source, path, name, ext, kind, size, modified, category, device_id, device_label, scanned_at))
-        count += 1
-        total += max(size, 0)
-        if len(rows) >= 5000:
-            db.executemany(insert_sql, rows)
-            rows.clear()
-            print(f"  [{source}] {count:,} files so far...", flush=True)
-    if rows:
-        db.executemany(insert_sql, rows)
-    finished = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    db.execute(
-        "INSERT INTO scans (source, started_at, finished_at, file_count, total_bytes) "
-        "VALUES (?, ?, ?, ?, ?)", (source, started, finished, count, total))
-    db.commit()
-    print(f"  [{source}] done: {count:,} media files, {fmt_size(total)} in {time.time() - t0:.1f}s")
-    return count, total
 
 
 def fmt_size(n: int) -> str:
@@ -466,28 +662,224 @@ def fmt_size(n: int) -> str:
     return f"{n} B"
 
 
-def cmd_scan(args):
-    sources = args.sources or ["local", "onedrive", "gdrive"]
-    db = get_db()
+def backfill_meta_fingerprints(db: sqlite3.Connection) -> int:
+    rows = db.execute(
+        "SELECT id, size, modified, name, ext, kind FROM files "
+        "WHERE meta_fingerprint IS NULL OR meta_fingerprint = ''"
+    ).fetchall()
+    updated = 0
+    batch = []
+    for row_id, size, modified, name, ext, kind in rows:
+        fp = compute_meta_fingerprint(size or -1, modified or "", name, ext, kind)
+        batch.append((fp, row_id))
+        if len(batch) >= 5000:
+            db.executemany("UPDATE files SET meta_fingerprint = ? WHERE id = ?", batch)
+            updated += len(batch)
+            batch.clear()
+    if batch:
+        db.executemany("UPDATE files SET meta_fingerprint = ? WHERE id = ?", batch)
+        updated += len(batch)
+    if updated:
+        db.commit()
+    return updated
+
+
+def run_scan(db: sqlite3.Connection, source: str, row_iter,
+             device_id: str, device_label: str,
+             scope_path: str | None = None, cancel_event=None,
+             progress_cb=None) -> tuple[int, int]:
+    started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    scanned_at = started
+    rows = []
+    count = 0
+    total = 0
+    t0 = time.time()
+    insert_sql = (
+        "INSERT OR REPLACE INTO files "
+        "(source, path, name, ext, kind, size, modified, category, "
+        "device_id, device_label, scanned_at, meta_fingerprint, content_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "(SELECT content_hash FROM files WHERE source=? AND device_id=? AND path=?))")
+    if scope_path:
+        like = scope_path.replace("\\", "/").rstrip("/") + "%"
+        db.execute(
+            "DELETE FROM files WHERE source = ? AND "
+            "(device_id = ? OR device_id IS NULL OR device_id = 'legacy-machine') "
+            "AND REPLACE(path, '\\\\', '/') LIKE REPLACE(?, '\\\\', '/')",
+            (source, device_id, like),
+        )
+    elif source in ("local", "onedrive"):
+        db.execute(
+            "DELETE FROM files WHERE source = ? "
+            "AND (device_id = ? OR device_id = 'legacy-machine' OR device_id IS NULL)",
+            (source, device_id),
+        )
+    else:
+        db.execute("DELETE FROM files WHERE source = ?", (source,))
+    cancelled = False
+    for path, name, ext, kind, size, modified, category in row_iter:
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            break
+        meta_fp = compute_meta_fingerprint(size, modified, name, ext, kind)
+        rows.append((source, path, name, ext, kind, size, modified, category,
+                     device_id, device_label, scanned_at, meta_fp,
+                     source, device_id, path))
+        count += 1
+        total += max(size, 0)
+        if len(rows) >= 5000:
+            db.executemany(insert_sql, rows)
+            rows.clear()
+            db.commit()
+            msg = f"  [{source}] {count:,} files so far..."
+            print(msg, flush=True)
+            if progress_cb:
+                progress_cb(source=source, phase="scan", files=count, message=msg)
+    if rows:
+        db.executemany(insert_sql, rows)
+    finished = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if count:
+        db.execute(
+            "INSERT INTO scans (source, started_at, finished_at, file_count, total_bytes) "
+            "VALUES (?, ?, ?, ?, ?)", (source, started, finished, count, total))
+    db.commit()
+    status = "cancelled" if cancelled else "done"
+    print(f"  [{source}] {status}: {count:,} media files, {fmt_size(total)} in {time.time() - t0:.1f}s")
+    if progress_cb:
+        progress_cb(source=source, phase="scan", files=count,
+                    message=f"{source} scan {status}", cancelled=cancelled)
+    return count, total
+
+
+def run_hash_pass(db: sqlite3.Connection, sources: list[str] | None = None,
+                  path_prefix: str = "", missing_only: bool = True,
+                  cancel_event=None, progress_cb=None) -> int:
+    where = ["1=1"]
+    args: list = []
+    if missing_only:
+        where.append("(content_hash IS NULL OR content_hash = '')")
+    if sources:
+        where.append(f"source IN ({','.join('?' * len(sources))})")
+        args.extend(sources)
+    if path_prefix:
+        where.append("REPLACE(path, '\\\\', '/') LIKE ?")
+        args.append(path_prefix.replace("\\", "/").rstrip("/") + "%")
+    sql = (
+        "SELECT id, source, path FROM files WHERE "
+        + " AND ".join(where)
+        + " ORDER BY source, path"
+    )
+    rows = db.execute(sql, args).fetchall()
+    done = 0
+    t0 = time.time()
+    for row_id, source, path in rows:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        digest = hash_file_row(source, path, cancel_event)
+        if digest is None:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            continue
+        db.execute("UPDATE files SET content_hash = ? WHERE id = ?", (digest, row_id))
+        done += 1
+        if done % 100 == 0:
+            db.commit()
+            msg = f"  [hash] {done:,}/{len(rows):,} files hashed..."
+            print(msg, flush=True)
+            if progress_cb:
+                progress_cb(source="hash", phase="hash", files=done, total=len(rows), message=msg)
+    db.commit()
+    status = "cancelled" if cancel_event is not None and cancel_event.is_set() else "done"
+    print(f"  [hash] {status}: {done:,} content hashes in {time.time() - t0:.1f}s")
+    if progress_cb:
+        progress_cb(source="hash", phase="hash", files=done, total=len(rows),
+                    message=f"hash {status}", cancelled=status == "cancelled")
+    return done
+
+
+def iter_source_rows(source: str, path_prefix: str = "", cancel_event=None):
     local_device_id, local_device_label = get_machine_identity()
-    gdrive_device_id, gdrive_device_label = "gdrive-shared", "Google Drive remote"
-    for source in sources:
-        print(f"Scanning {source}...")
-        try:
-            if source == "local":
-                run_scan(db, "local", walk_filesystem(LOCAL_ROOTS, exclude=ONEDRIVE_ROOT),
-                         local_device_id, local_device_label)
-            elif source == "onedrive":
-                run_scan(db, "onedrive", walk_filesystem([ONEDRIVE_ROOT]),
-                         local_device_id, local_device_label)
-            elif source == "gdrive":
-                run_scan(db, "gdrive", scan_gdrive(),
-                         gdrive_device_id, gdrive_device_label)
-            else:
-                print(f"  unknown source: {source}", file=sys.stderr)
-        except Exception as exc:
-            print(f"  [{source}] FAILED: {exc}", file=sys.stderr)
-    db.close()
+    qnap_cfg = load_qnap_config()
+    if source == "local":
+        return _filter_rows(
+            walk_filesystem(LOCAL_ROOTS, exclude=ONEDRIVE_ROOT,
+                            path_prefix=path_prefix, cancel_event=cancel_event),
+            path_prefix, cancel_event)
+    if source == "onedrive":
+        roots = [Path(path_prefix)] if path_prefix else [ONEDRIVE_ROOT]
+        return _filter_rows(
+            walk_filesystem(roots, path_prefix=path_prefix, cancel_event=cancel_event),
+            path_prefix, cancel_event)
+    if source == "gdrive":
+        return _filter_rows(scan_gdrive(path_prefix), path_prefix, cancel_event)
+    if source == "qnap":
+        return _filter_rows(scan_qnap(cancel_event, path_prefix), path_prefix, cancel_event)
+    raise ValueError(f"unknown source: {source}")
+
+
+def device_for_source(source: str) -> tuple[str, str]:
+    if source in ("local", "onedrive"):
+        return get_machine_identity()
+    if source == "gdrive":
+        return "gdrive-shared", "Google Drive remote"
+    qnap_cfg = load_qnap_config()
+    if source == "qnap" and qnap_cfg:
+        return qnap_device_identity(qnap_cfg)
+    return "unknown", source
+
+
+def scan_sources(sources: list[str] | None = None, path_prefix: str = "",
+                 hash_missing: bool = True, cancel_event=None, progress_cb=None) -> dict:
+    sources = sources or default_sources()
+    db = get_db()
+    backfill_meta_fingerprints(db)
+    totals = {"sources": {}, "hashed": 0, "cancelled": False}
+    try:
+        for source in sources:
+            if cancel_event is not None and cancel_event.is_set():
+                totals["cancelled"] = True
+                break
+            if progress_cb:
+                progress_cb(source=source, phase="scan", files=0, message=f"Scanning {source}...")
+            device_id, device_label = device_for_source(source)
+            try:
+                count, size = run_scan(
+                    db, source,
+                    iter_source_rows(source, path_prefix, cancel_event),
+                    device_id, device_label,
+                    scope_path=path_prefix or None,
+                    cancel_event=cancel_event,
+                    progress_cb=progress_cb,
+                )
+                totals["sources"][source] = {"files": count, "bytes": size}
+            except Exception as exc:
+                totals["sources"][source] = {"error": str(exc)}
+            if cancel_event is not None and cancel_event.is_set():
+                totals["cancelled"] = True
+                break
+        if hash_missing and not totals.get("cancelled"):
+            totals["hashed"] = run_hash_pass(
+                db, sources=sources, path_prefix=path_prefix,
+                missing_only=True, cancel_event=cancel_event, progress_cb=progress_cb)
+            if cancel_event is not None and cancel_event.is_set():
+                totals["cancelled"] = True
+    finally:
+        db.close()
+    return totals
+
+
+def cmd_scan(args):
+    cancel_event = None
+    totals = scan_sources(
+        sources=args.sources or None,
+        path_prefix=getattr(args, "path_prefix", "") or "",
+        hash_missing=not getattr(args, "no_hash", False),
+    )
+    for source, info in totals.get("sources", {}).items():
+        if "error" in info:
+            print(f"  [{source}] FAILED: {info['error']}", file=sys.stderr)
+    if totals.get("hashed"):
+        print(f"  Hashed {totals['hashed']:,} files")
 
 
 def cmd_search(args):
@@ -558,14 +950,29 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_scan = sub.add_parser("scan", help="scan sources and rebuild their index")
-    p_scan.add_argument("sources", nargs="*", choices=["local", "onedrive", "gdrive"],
-                        help="sources to scan (default: all)")
+    p_scan.add_argument("sources", nargs="*",
+                        choices=["local", "onedrive", "gdrive", "qnap"],
+                        help="sources to scan (default: all configured)")
+    p_scan.add_argument("--path", dest="path_prefix", default="",
+                        help="optional folder path to limit scan scope")
+    p_scan.add_argument("--no-hash", action="store_true",
+                        help="skip content hash computation after scan")
     p_scan.set_defaults(func=cmd_scan)
+
+    p_qnap = sub.add_parser("qnap-setup", help="save QNAP NAS credentials locally")
+    p_qnap.add_argument("--host", default="192.168.50.168")
+    p_qnap.add_argument("--web-url", default="http://192.168.50.168:8080/")
+    p_qnap.add_argument("--share", default="Public",
+                        help="SMB share name to scan (default: Public)")
+    p_qnap.add_argument("--user", required=True)
+    p_qnap.add_argument("--password", help="QNAP password (prompted if omitted)")
+    p_qnap.add_argument("--label", default="QNAP NAS")
+    p_qnap.set_defaults(func=cmd_qnap_setup)
 
     p_search = sub.add_parser("search", help="search the index by filename")
     p_search.add_argument("term")
     p_search.add_argument("--kind", choices=["video", "audio", "image", "document"])
-    p_search.add_argument("--source", choices=["local", "onedrive", "gdrive"])
+    p_search.add_argument("--source", choices=["local", "onedrive", "gdrive", "qnap"])
     p_search.add_argument("--category",
                           choices=["photo", "graphic", "text", "data", "word",
                                    "spreadsheet", "presentation", "pdf"],

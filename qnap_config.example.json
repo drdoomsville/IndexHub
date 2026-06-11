@@ -1,0 +1,8 @@
+{
+  "host": "192.168.50.168",
+  "web_url": "http://192.168.50.168:8080/",
+  "share": "Public",
+  "user": "your-qnap-username",
+  "pass": "your-qnap-password",
+  "label": "QNAP NAS"
+}
