@@ -1,4 +1,7 @@
 media_index.db*
+*_cleanup_manifest.json
+*_verified_dupes.json
+foodieness_cleanup_manifest.json
 qnap_config.json
 .trash/
 __pycache__/
