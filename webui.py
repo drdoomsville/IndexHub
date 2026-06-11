@@ -13,11 +13,14 @@ import re
 import shutil
 import sqlite3
 import subprocess
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse, parse_qs
 
 import media_index as mi
+import scan_jobs
+import file_ops
 
 DB_PATH = Path(__file__).parent / "media_index.db"
 PAGE_SIZE = 100
@@ -63,12 +66,17 @@ APP_HTML = """<!DOCTYPE html>
   .card .num { font-size: 20px; font-weight: 600; }
   .card .lbl { color: var(--muted); font-size: 12px; text-transform: uppercase;
                letter-spacing: .6px; }
-  .controls { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .controls { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+  .controls-search input { width: 100%; box-sizing: border-box; }
+  .controls-filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .controls-filters select { flex: 1 1 160px; min-width: 160px; max-width: 100%; }
+  .controls-filters #machine { flex: 2 1 220px; min-width: 220px; }
+  #resetBtn { border-color: #3d4458; color: var(--muted); flex: 0 0 auto; }
+  #resetBtn:hover { color: var(--text); border-color: var(--accent); }
   input, select { background: var(--panel2); color: var(--text);
     border: 1px solid #2c3344; border-radius: 8px; padding: 9px 12px;
     font-size: 14px; outline: none; }
   input:focus, select:focus { border-color: var(--accent); }
-  input[type=search] { flex: 1; min-width: 220px; }
   .content { display: flex; gap: 16px; align-items: flex-start; }
   .results { flex: 1; min-width: 0; }
   table { width: 100%; border-collapse: collapse; background: var(--panel);
@@ -82,6 +90,25 @@ APP_HTML = """<!DOCTYPE html>
   tbody tr { cursor: pointer; }
   tr:hover td { background: #1d2230; }
   tr.sel td { background: #233252 !important; }
+  tr.marked td { opacity: .72; }
+  tr.marked td:first-child { text-decoration: line-through; color: var(--video); }
+  .trash-bar { position: fixed; left: 0; right: 0; bottom: 0; background: #1a1520;
+    border-top: 1px solid #4a3040; padding: 10px 20px; z-index: 20; max-height: 38vh;
+    overflow: auto; }
+  .trash-bar h3 { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  .trash-item { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    padding: 6px 0; border-bottom: 1px solid #2a2230; font-size: 13px; }
+  .trash-item .nm { flex: 1; min-width: 140px; word-break: break-all; }
+  .trash-item .meta { color: var(--muted); font-size: 12px; }
+  .opsmsg { font-size: 12.5px; margin-top: 8px; min-height: 18px; }
+  .opsmsg.ok { color: var(--image); }
+  .opsmsg.err { color: var(--video); }
+  .renlbl { margin-top: 4px; }
+  .mark-row { display: flex; align-items: center; gap: 8px; margin: 10px 0; font-size: 13px; }
+  .mark-row input { width: auto; }
+  .btn-danger { border-color: #7a3040 !important; color: #ff9cab !important; }
+  .btn-danger:hover { border-color: var(--video) !important; color: var(--video) !important; }
+  body.has-trash { padding-bottom: 120px; }
   .badge { display: inline-block; padding: 1px 9px; border-radius: 99px;
            font-size: 11.5px; font-weight: 600; }
   .badge.video { background: #3d1d1d; color: var(--video); }
@@ -136,31 +163,45 @@ APP_HTML = """<!DOCTYPE html>
   #renamemsg { font-size: 12.5px; margin-top: 8px; min-height: 18px; }
   #renamemsg.ok { color: var(--image); }
   #renamemsg.err { color: var(--video); }
+  .classify-btns { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  #classifymsg { font-size: 12.5px; margin-bottom: 12px; min-height: 18px; }
+  #classifymsg.ok { color: var(--image); }
+  #classifymsg.err { color: var(--video); }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="topnav"><a href="/">&larr; All indexes</a></div>
+  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/duplicates">Duplicates</a></div>
   <h1>__TITLE__ <span>Index</span></h1>
   <div class="sub" id="sub">Loading&hellip;</div>
   <div class="cards" id="cards"></div>
   <div class="controls">
-    <input type="search" id="q" placeholder="Search filename or path&hellip;" autofocus>
-    <select id="kind"></select>
-    <select id="source">
-      <option value="">All sources</option>
-      <option value="local">Local</option>
-      <option value="onedrive">OneDrive</option>
-      <option value="gdrive">Google Drive</option>
-    </select>
-    <select id="machine"></select>
-    <select id="year"><option value="">Any year</option></select>
-    <select id="sort">
-      <option value="modified">Newest first</option>
-      <option value="size">Largest first</option>
-      <option value="name">Name A&ndash;Z</option>
-      <option value="path">Path A&ndash;Z</option>
-    </select>
+    <div class="controls-search">
+      <input type="search" id="q" placeholder="Search filename or path&hellip;" autofocus>
+    </div>
+    <div class="controls-filters">
+      <select id="kind">
+        <option value="">All types</option>
+      </select>
+      <select id="source">
+        <option value="">All sources</option>
+        <option value="local">Local</option>
+        <option value="onedrive">OneDrive</option>
+        <option value="gdrive">Google Drive</option>
+        <option value="qnap">QNAP NAS</option>
+      </select>
+      <select id="machine">
+        <option value="">All machines</option>
+      </select>
+      <select id="year"><option value="">Any year</option></select>
+      <select id="sort">
+        <option value="modified">Newest first</option>
+        <option value="size">Largest first</option>
+        <option value="name">Name A&ndash;Z</option>
+        <option value="path">Path A&ndash;Z</option>
+      </select>
+      <button id="resetBtn" type="button">Reset filters</button>
+    </div>
   </div>
   <div class="content">
     <div class="results">
@@ -181,6 +222,21 @@ APP_HTML = """<!DOCTYPE html>
       <h2 id="fname"></h2>
       <div id="pv"></div>
       <div class="meta" id="fmeta"></div>
+      <div id="classifyBlock" hidden>
+        <div class="renlbl">Classification</div>
+        <div class="classify-btns">
+          <button id="markPhoto" type="button">Mark as photo</button>
+          <button id="markGraphic" type="button">Mark as computer image</button>
+        </div>
+        <div id="classifymsg"></div>
+      </div>
+      <button id="dupBtn" type="button" style="width:100%;margin-bottom:12px">Check duplicates</button>
+      <div class="renlbl">File actions</div>
+      <label class="mark-row"><input type="checkbox" id="markDelete"> Mark for deletion</label>
+      <input id="moveDest" placeholder="Move to folder (full path)" spellcheck="false">
+      <button id="moveBtn" type="button" style="width:100%;margin-bottom:8px">Move file</button>
+      <button id="deleteBtn" type="button" class="btn-danger" style="width:100%;margin-bottom:12px">Delete file</button>
+      <div id="opsmsg" class="opsmsg"></div>
       <div class="renlbl">Rename &middot; suggestions</div>
       <div class="chips" id="chips"></div>
       <input id="newname" spellcheck="false">
@@ -188,6 +244,10 @@ APP_HTML = """<!DOCTYPE html>
       <div id="renamemsg"></div>
     </aside>
   </div>
+</div>
+<div class="trash-bar" id="trashBar" hidden>
+  <h3>Session trash &mdash; restore before closing the browser</h3>
+  <div id="trashList"></div>
 </div>
 <script>
 const PAGE = __CONFIG__;
@@ -208,6 +268,11 @@ function fmtSize(n) {
 const esc = s => (s ?? "").replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
+function dirOf(path) {
+  const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\\\"));
+  return i > 0 ? path.slice(0, i) : path;
+}
+
 async function loadStats() {
   const s = await (await fetch("/api/stats?domain=" + PAGE.domain)).json();
   const cats = Object.entries(s.categories)
@@ -223,7 +288,7 @@ async function loadStats() {
 const KIND_OPTS = PAGE.kindOpts;
 const SOURCE_OPTS = [
   ["", "All sources"], ["local", "Local"],
-  ["onedrive", "OneDrive"], ["gdrive", "Google Drive"],
+  ["onedrive", "OneDrive"], ["gdrive", "Google Drive"], ["qnap", "QNAP NAS"],
 ];
 
 function setOptions(sel, opts) {
@@ -264,6 +329,19 @@ async function updateFacets() {
   setOptions($("year"), [{value: "", label: "Any year", count: null}, ...years]);
 }
 
+function resetFilters() {
+  $("q").value = "";
+  $("kind").value = "";
+  $("source").value = "local";
+  $("machine").value = "";
+  $("year").value = "";
+  $("sort").value = "modified";
+  page = 0;
+  closePanel();
+  updateFacets();
+  search();
+}
+
 async function search() {
   const p = new URLSearchParams({
     domain: PAGE.domain, q: $("q").value, kind: $("kind").value,
@@ -274,8 +352,8 @@ async function search() {
   total = d.total;
   lastRows = d.rows;
   $("rows").innerHTML = d.rows.length ? d.rows.map((r, i) => `<tr data-i="${i}"
-      class="${sel && sel.id === r.id ? "sel" : ""}">
-      <td>${esc(r.name)}</td>
+      class="${sel && sel.id === r.id ? "sel" : ""}${r.marked_delete ? " marked" : ""}">
+      <td>${r.marked_delete ? "&#9888; " : ""}${esc(r.name)}</td>
       <td><span class="badge ${r.category || r.kind}">${r.category || r.kind}</span></td>
       <td class="src">${esc(r.source)}</td>
       <td class="src">${esc(r.device_label || "-")}</td>
@@ -321,6 +399,18 @@ async function openPanel(r) {
     `<b>${esc(r.category || r.kind)}</b> \u00b7 ${fmtSize(r.size)} \u00b7 ` +
     `${r.modified ? esc(r.modified.slice(0,10)) : "no date"} \u00b7 ${esc(r.source)} \u00b7 ${esc(r.device_label || "-")}<br>` +
     `${esc(r.path)}`;
+  const showClassify = r.kind === "image";
+  $("classifyBlock").hidden = !showClassify;
+  $("classifymsg").textContent = "";
+  $("classifymsg").className = "";
+  if (showClassify) {
+    $("markPhoto").disabled = r.category === "photo";
+    $("markGraphic").disabled = r.category === "graphic";
+  }
+  $("markDelete").checked = !!r.marked_delete;
+  $("moveDest").value = dirOf(r.path);
+  $("opsmsg").textContent = "";
+  $("opsmsg").className = "opsmsg";
   $("newname").value = r.name;
   $("renamemsg").textContent = "";
   $("renamemsg").className = "";
@@ -345,6 +435,124 @@ function closePanel() {
   document.querySelectorAll("#rows tr.sel").forEach(x => x.classList.remove("sel"));
 }
 $("closePanel").onclick = closePanel;
+async function reclassify(category) {
+  if (!sel || sel.kind !== "image") return;
+  $("classifymsg").textContent = "Saving\u2026";
+  $("classifymsg").className = "";
+  try {
+    const res = await (await fetch("/api/reclassify", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id: sel.id, category}),
+    })).json();
+    if (res.ok) {
+      sel.category = res.category;
+      $("classifymsg").textContent = "Updated \u2713";
+      $("classifymsg").className = "ok";
+      $("markPhoto").disabled = res.category === "photo";
+      $("markGraphic").disabled = res.category === "graphic";
+      $("fmeta").innerHTML =
+        `<b>${esc(res.category)}</b> \u00b7 ${fmtSize(sel.size)} \u00b7 ` +
+        `${sel.modified ? esc(sel.modified.slice(0,10)) : "no date"} \u00b7 ${esc(sel.source)} \u00b7 ${esc(sel.device_label || "-")}<br>` +
+        `${esc(sel.path)}`;
+      search();
+      updateFacets();
+    } else {
+      $("classifymsg").textContent = res.error || "Update failed";
+      $("classifymsg").className = "err";
+    }
+  } catch (err) {
+    $("classifymsg").textContent = "Update failed: " + err;
+    $("classifymsg").className = "err";
+  }
+}
+$("markPhoto").onclick = () => reclassify("photo");
+$("markGraphic").onclick = () => reclassify("graphic");
+$("dupBtn").onclick = () => {
+  if (sel) location.href = "/duplicates?file_id=" + encodeURIComponent(sel.id);
+};
+async function loadTrash() {
+  const d = await (await fetch("/api/trash")).json();
+  const bar = $("trashBar");
+  const list = $("trashList");
+  if (!d.items.length) {
+    bar.hidden = true;
+    document.body.classList.remove("has-trash");
+    return;
+  }
+  bar.hidden = false;
+  document.body.classList.add("has-trash");
+  list.innerHTML = d.items.map(it => `
+    <div class="trash-item">
+      <span class="nm">${esc(it.name)}</span>
+      <span class="meta">${esc(it.source)} \u00b7 ${esc(it.original_path)}</span>
+      <button type="button" data-restore="${esc(it.entry_id)}">Restore</button>
+    </div>`).join("");
+}
+$("trashList").addEventListener("click", async e => {
+  const id = e.target.dataset.restore;
+  if (!id) return;
+  const res = await (await fetch("/api/restore", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({entry_id: id}),
+  })).json();
+  if (res.ok) { loadTrash(); search(); updateFacets(); loadStats(); }
+  else alert(res.error || "Restore failed");
+});
+$("markDelete").addEventListener("change", async () => {
+  if (!sel) return;
+  const res = await (await fetch("/api/mark-delete", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({id: sel.id, marked: $("markDelete").checked}),
+  })).json();
+  if (res.ok) {
+    sel.marked_delete = res.marked_delete;
+    search();
+  } else {
+    $("markDelete").checked = ! $("markDelete").checked;
+    $("opsmsg").textContent = res.error || "Could not update mark";
+    $("opsmsg").className = "opsmsg err";
+  }
+});
+$("moveBtn").onclick = async () => {
+  if (!sel) return;
+  $("opsmsg").textContent = "Moving\u2026";
+  $("opsmsg").className = "opsmsg";
+  const res = await (await fetch("/api/move", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({id: sel.id, dest_dir: $("moveDest").value.trim()}),
+  })).json();
+  if (res.ok) {
+    sel.path = res.path; sel.name = res.name; sel.ext = res.ext;
+    $("fname").textContent = res.name;
+    $("opsmsg").textContent = "Moved \u2713";
+    $("opsmsg").className = "opsmsg ok";
+    search();
+  } else {
+    $("opsmsg").textContent = res.error || "Move failed";
+    $("opsmsg").className = "opsmsg err";
+  }
+};
+$("deleteBtn").onclick = async () => {
+  if (!sel) return;
+  if (!confirm(`Delete "${sel.name}"?\n\nYou can restore it from Session trash until you close the browser.`)) return;
+  $("opsmsg").textContent = "Deleting\u2026";
+  $("opsmsg").className = "opsmsg";
+  const res = await (await fetch("/api/delete", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({id: sel.id}),
+  })).json();
+  if (res.ok) {
+    closePanel();
+    loadTrash();
+    search();
+    updateFacets();
+    loadStats();
+  } else {
+    $("opsmsg").textContent = res.error || "Delete failed";
+    $("opsmsg").className = "opsmsg err";
+  }
+};
 $("chips").addEventListener("click", e => {
   if (e.target.classList.contains("chip")) $("newname").value = e.target.textContent;
 });
@@ -384,6 +592,7 @@ $("q").addEventListener("input", () => {
 for (const id of ["kind","source","machine","year"])
   $(id).addEventListener("change", () => { page = 0; closePanel(); search(); updateFacets(); });
 $("sort").addEventListener("change", () => { page = 0; search(); });
+$("resetBtn").onclick = resetFilters;
 $("prev").onclick = () => { page--; search(); };
 $("next").onclick = () => { page++; search(); };
 
@@ -393,6 +602,7 @@ setOptions($("machine"), [{value: "", label: "All machines", count: null}]);
 loadStats();
 updateFacets();
 search();
+loadTrash();
 </script>
 </body>
 </html>
@@ -427,12 +637,31 @@ LANDING_HTML = """<!DOCTYPE html>
   .stats b { color: var(--text); font-size: 17px; }
   .open { color: var(--accent); font-size: 13.5px; font-weight: 600;
           margin-top: 14px; display: inline-block; }
+  .topnav { margin-bottom: 18px; }
+  .topnav a { color: var(--muted); text-decoration: none; font-size: 13px; margin-right: 8px; }
+  .topnav a:hover { color: var(--accent); }
+  .scan-panel { background: var(--panel); border: 1px solid #262b38; border-radius: 14px;
+    padding: 22px 26px; margin-top: 28px; }
+  .scan-panel h2 { font-size: 17px; margin-bottom: 12px; }
+  .scan-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
+  .scan-row select, .scan-row input { background: var(--panel2); color: var(--text);
+    border: 1px solid #2c3344; border-radius: 8px; padding: 9px 12px; font-size: 14px; }
+  .scan-row input { flex: 1; min-width: 220px; }
+  .scan-row button { background: var(--panel2); color: var(--text); border: 1px solid #2c3344;
+    border-radius: 8px; padding: 9px 16px; cursor: pointer; font-size: 13.5px; }
+  .scan-row button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .scan-row button:hover:not(:disabled) { border-color: var(--accent); }
+  .scan-row button:disabled { opacity: .45; cursor: default; }
+  #scanStatus { color: var(--muted); font-size: 13px; line-height: 1.7; min-height: 40px; }
+  #scanStatus.running { color: var(--text); }
+  label.chk { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
 </style>
 </head>
 <body>
 <div class="wrap">
+  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/duplicates">Duplicates</a></div>
   <h1>File <span>Index</span> Hub</h1>
-  <div class="sub">Your local, OneDrive, and Google Drive files, indexed and searchable.</div>
+  <div class="sub">Your local, OneDrive, Google Drive, and QNAP NAS files, indexed and searchable.</div>
   <div class="grid">
     <a class="bigcard" href="/media">
       <div class="icon">&#127916;</div>
@@ -448,6 +677,35 @@ LANDING_HTML = """<!DOCTYPE html>
       <div class="stats" id="documents-stats">Loading&hellip;</div>
       <span class="open">Open &rarr;</span>
     </a>
+    <a class="bigcard" href="/duplicates">
+      <div class="icon">&#128257;</div>
+      <h2>Duplicate Checker</h2>
+      <div class="desc">Find matches by filename, metadata fingerprint, or content hash</div>
+      <div class="stats" id="dup-stats">Loading&hellip;</div>
+      <span class="open">Open &rarr;</span>
+    </a>
+  </div>
+  <div class="scan-panel">
+    <h2>Rescan / Reindex</h2>
+    <div class="scan-row">
+      <select id="scanScope">
+        <option value="all">All drives</option>
+        <option value="local">Local only</option>
+        <option value="onedrive">OneDrive only</option>
+        <option value="gdrive">Google Drive only</option>
+        <option value="qnap">QNAP NAS only</option>
+      </select>
+      <input id="scanPath" type="text" placeholder="Optional folder path (limits scope)">
+    </div>
+    <div class="scan-row">
+      <label class="chk"><input type="checkbox" id="scanRescan" checked> Reindex files</label>
+      <label class="chk"><input type="checkbox" id="scanHash" checked> Compute missing hashes</label>
+    </div>
+    <div class="scan-row">
+      <button class="primary" id="scanStart">Start scan</button>
+      <button id="scanCancel" disabled>Cancel</button>
+    </div>
+    <div id="scanStatus">Idle</div>
   </div>
 </div>
 <script>
@@ -466,6 +724,166 @@ for (const domain of ["media", "documents"]) {
       `<span style="font-size:12.5px">${cats || "&nbsp;"}</span>`;
   });
 }
+fetch("/api/duplicates/summary").then(r => r.json()).then(s => {
+  document.getElementById("dup-stats").innerHTML =
+    `<b>${s.groups.toLocaleString()}</b> duplicate groups \u00b7 ` +
+    `<span style="font-size:12.5px">${s.hashed.toLocaleString()} hashed / ${s.total.toLocaleString()} indexed</span>`;
+}).catch(() => {
+  document.getElementById("dup-stats").textContent = "Open to scan for duplicates";
+});
+let scanPoll;
+async function refreshScanStatus() {
+  const s = await (await fetch("/api/scan/status")).json();
+  const el = document.getElementById("scanStatus");
+  const startBtn = document.getElementById("scanStart");
+  const cancelBtn = document.getElementById("scanCancel");
+  startBtn.disabled = s.running;
+  cancelBtn.disabled = !s.running;
+  el.className = s.running ? "running" : "";
+  if (s.running) {
+    const prog = s.total ? ` (${s.files.toLocaleString()} / ${s.total.toLocaleString()})` : (s.files ? ` (${s.files.toLocaleString()} files)` : "");
+    el.textContent = `${s.phase}${s.source ? " \u00b7 " + s.source : ""}: ${s.message}${prog}`;
+  } else if (s.error) {
+    el.textContent = "Error: " + s.error;
+  } else if (s.phase === "done") {
+    el.textContent = "Last run complete. " + (s.message || "");
+  } else if (s.phase === "cancelled") {
+    el.textContent = "Last run cancelled safely.";
+  } else {
+    el.textContent = "Idle";
+  }
+  if (!s.running && scanPoll) { clearInterval(scanPoll); scanPoll = null; }
+}
+document.getElementById("scanStart").onclick = async () => {
+  const scope = document.getElementById("scanScope").value;
+  const body = {
+    sources: scope === "all" ? null : [scope],
+    path_prefix: document.getElementById("scanPath").value.trim(),
+    rescan: document.getElementById("scanRescan").checked,
+    hash_missing: document.getElementById("scanHash").checked,
+  };
+  const res = await (await fetch("/api/scan/start", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  })).json();
+  if (!res.ok) { document.getElementById("scanStatus").textContent = res.error || "Could not start"; return; }
+  if (!scanPoll) scanPoll = setInterval(refreshScanStatus, 1500);
+  refreshScanStatus();
+};
+document.getElementById("scanCancel").onclick = async () => {
+  await fetch("/api/scan/cancel", {method: "POST"});
+  refreshScanStatus();
+};
+refreshScanStatus();
+</script>
+</body>
+</html>
+"""
+
+DUPS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duplicate Checker</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --panel2:#1f2330; --text:#e6e9f0; --muted:#8b93a7; --accent:#5b8cff; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--text); font:14px/1.5 "Segoe UI", system-ui, sans-serif; }
+  .wrap { max-width:1200px; margin:0 auto; padding:24px 20px 60px; }
+  h1 { font-size:22px; font-weight:600; }
+  h1 span { color:var(--accent); }
+  .sub { color:var(--muted); margin:4px 0 18px; font-size:13px; }
+  .topnav { margin-bottom:10px; }
+  .topnav a { color:var(--muted); text-decoration:none; font-size:13px; margin-right:8px; }
+  .topnav a:hover { color:var(--accent); }
+  .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
+  .tabs button { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px;
+    padding:8px 14px; cursor:pointer; font-size:13px; }
+  .tabs button.active { border-color:var(--accent); color:var(--accent); }
+  .group { background:var(--panel); border:1px solid #262b38; border-radius:10px; margin-bottom:14px; overflow:hidden; }
+  .group-h { padding:10px 14px; background:var(--panel2); font-size:13px; color:var(--muted); word-break:break-all; }
+  .group-h b { color:var(--text); }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 12px; border-top:1px solid #232836; font-size:13px; }
+  th { color:var(--muted); font-size:11px; text-transform:uppercase; }
+  td.path { color:var(--muted); font-family:Consolas,monospace; font-size:12px; word-break:break-all; white-space:normal; }
+  .empty { padding:40px; text-align:center; color:var(--muted); }
+  .pager { display:flex; gap:10px; align-items:center; margin-top:14px; color:var(--muted); }
+  button { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px;
+    padding:7px 16px; cursor:pointer; font-size:13.5px; }
+  button:hover:not(:disabled) { border-color:var(--accent); }
+  button:disabled { opacity:.4; cursor:default; }
+  .anchor { background:#233252; border:1px solid #3a5080; border-radius:8px; padding:10px 14px; margin-bottom:14px; font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/media">Media</a> &middot; <a href="/documents">Documents</a></div>
+  <h1>Duplicate <span>Checker</span></h1>
+  <div class="sub" id="sub">Cross-drive duplicate detection by filename, metadata fingerprint, and content hash.</div>
+  <div class="tabs">
+    <button data-mode="name" class="active">Filename</button>
+    <button data-mode="meta">Metadata</button>
+    <button data-mode="hash">Content hash</button>
+  </div>
+  <div id="anchor" hidden></div>
+  <div id="groups"></div>
+  <div class="pager">
+    <button id="prev">&larr; Prev</button>
+    <span id="pageinfo"></span>
+    <button id="next">Next &rarr;</button>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const params = new URLSearchParams(location.search);
+let mode = "name", page = 0, fileId = params.get("file_id") || "";
+function fmtSize(n) {
+  if (n == null || n < 0) return "";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toLocaleString(undefined, {maximumFractionDigits: 1}) + " " + u[i];
+}
+async function load() {
+  const p = new URLSearchParams({mode, page, limit: 25});
+  if (fileId) p.set("file_id", fileId);
+  const d = await (await fetch("/api/duplicates?" + p)).json();
+  if (d.anchor) {
+    $("anchor").hidden = false;
+    $("anchor").innerHTML = `Showing duplicates for <b>${esc(d.anchor.name)}</b> (${esc(d.anchor.source)}) \u00b7 ` +
+      `<a href="/duplicates?mode=${mode}" style="color:var(--accent)">Show all groups</a>`;
+  } else {
+    $("anchor").hidden = true;
+  }
+  $("groups").innerHTML = d.groups.length ? d.groups.map(g => `
+    <div class="group">
+      <div class="group-h"><b>${g.count} files</b> \u00b7 ${esc(g.label)}</div>
+      <table><thead><tr><th>Name</th><th>Source</th><th>Size</th><th>Modified</th><th>Path</th></tr></thead>
+      <tbody>${g.files.map(f => `<tr>
+        <td>${esc(f.name)}</td><td>${esc(f.source)}</td><td>${fmtSize(f.size)}</td>
+        <td>${f.modified ? esc(f.modified.slice(0,10)) : ""}</td>
+        <td class="path">${esc(f.path)}</td></tr>`).join("")}</tbody></table>
+    </div>`).join("") : `<div class="empty">No duplicate groups found for this mode.</div>`;
+  const pages = Math.max(1, Math.ceil(d.total_groups / d.page_size));
+  $("pageinfo").textContent = `${d.total_groups.toLocaleString()} group(s) \u00b7 page ${page + 1} of ${pages}`;
+  $("prev").disabled = page === 0;
+  $("next").disabled = page >= pages - 1;
+}
+document.querySelectorAll(".tabs button").forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll(".tabs button").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    mode = btn.dataset.mode;
+    page = 0;
+    load();
+  };
+});
+$("prev").onclick = () => { page--; load(); };
+$("next").onclick = () => { page++; load(); };
+if (params.get("mode")) mode = params.get("mode");
+load();
 </script>
 </body>
 </html>
@@ -503,7 +921,7 @@ def render_app(page_key: str) -> bytes:
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = mi.get_db()
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -567,7 +985,7 @@ def _build_where(params, exclude: str | None = None):
         elif kind in CATEGORY_VALUES:
             where.append("category = ?")
             args.append(kind)
-    if exclude != "source" and source in ("local", "onedrive", "gdrive"):
+    if exclude != "source" and source in ("local", "onedrive", "gdrive", "qnap"):
         where.append("source = ?")
         args.append(source)
     if exclude != "machine" and machine:
@@ -616,7 +1034,8 @@ def api_search(params):
     conn = db()
     total = conn.execute(f"SELECT COUNT(*) FROM files WHERE {cond}", args).fetchone()[0]
     rows = [dict(r) for r in conn.execute(
-        f"SELECT id, source, device_id, device_label, path, name, ext, kind, size, modified, category "
+        f"SELECT id, source, device_id, device_label, path, name, ext, kind, size, modified, "
+        f"category, marked_delete "
         f"FROM files WHERE {cond} ORDER BY {sort} LIMIT ? OFFSET ?",
         args + [PAGE_SIZE, page * PAGE_SIZE])]
     conn.close()
@@ -640,6 +1059,21 @@ def _meaningful_folder(path: str) -> str | None:
     return None
 
 
+def _date_prefix(date_str: str) -> str | None:
+    """Turn a date string into yyyymmdd for filename prefixes."""
+    d = (date_str or "")[:10].replace(":", "-")
+    if len(d) >= 10 and d[4] == "-" and d[7] == "-":
+        return d.replace("-", "")
+    return None
+
+
+def _prefixed_filename(name: str, prefix: str) -> str:
+    if "." in name:
+        stem, ext = name.rsplit(".", 1)
+        return f"{prefix}-{re.sub(r'^\d{8}-', '', stem)}.{ext}"
+    return f"{prefix}-{re.sub(r'^\d{8}-', '', name)}"
+
+
 def api_suggest(params):
     row = get_file_row(params.get("id", [""])[0])
     if not row:
@@ -657,6 +1091,10 @@ def api_suggest(params):
 
     folder = _meaningful_folder(row["path"])
     candidates = []
+    prefix = _date_prefix(date)
+    if not prefix:
+        prefix = datetime.now().strftime("%Y%m%d")
+    candidates.append(_prefixed_filename(row["name"], prefix))
     if date:
         if folder:
             candidates.append(f"{date}_{folder}_{label}")
@@ -676,7 +1114,25 @@ def api_suggest(params):
         if full.lower() not in seen and full != row["name"]:
             seen.add(full.lower())
             suggestions.append(full)
-    return {"suggestions": suggestions[:5]}
+    return {"suggestions": suggestions[:6]}
+
+
+def api_reclassify(body):
+    row = get_file_row(body.get("id"))
+    if not row:
+        raise ValueError("File not found in index")
+    if row["kind"] != "image":
+        raise ValueError("Only images can be reclassified as photo or computer image")
+    category = body.get("category")
+    if category not in ("photo", "graphic"):
+        raise ValueError("Category must be photo or graphic")
+    if row["category"] == category:
+        raise ValueError("Classification is unchanged")
+    conn = db()
+    conn.execute("UPDATE files SET category = ? WHERE id = ?", (category, row["id"]))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "category": category}
 
 
 # --- rename ---------------------------------------------------------------------
@@ -705,15 +1161,17 @@ def api_rename(body):
         except OSError as exc:
             raise ValueError(f"Rename failed: {exc}") from exc
         new_path = str(new)
-    else:
+    elif row["source"] in ("gdrive", "qnap"):
         old_rel = row["path"]
         new_rel = str(PurePosixPath(old_rel).with_name(new_name))
         proc = subprocess.run(
             [mi.find_rclone(), "moveto",
-             f"{mi.GDRIVE_REMOTE}{old_rel}", f"{mi.GDRIVE_REMOTE}{new_rel}"],
+             mi.rclone_full_path(row["source"], old_rel),
+             mi.rclone_full_path(row["source"], new_rel)],
             capture_output=True, text=True, encoding="utf-8")
         if proc.returncode != 0:
-            raise ValueError(f"Google Drive rename failed: {proc.stderr.strip()[:300]}")
+            label = "Google Drive" if row["source"] == "gdrive" else "QNAP"
+            raise ValueError(f"{label} rename failed: {proc.stderr.strip()[:300]}")
         new_path = new_rel
 
     new_ext = new_name.rsplit(".", 1)[-1].lower() if "." in new_name else ""
@@ -725,15 +1183,241 @@ def api_rename(body):
     return {"ok": True, "name": new_name, "path": new_path, "ext": new_ext}
 
 
+# --- duplicates -----------------------------------------------------------------
+
+DUP_MODES = {
+    "name": "LOWER(name)",
+    "meta": "meta_fingerprint",
+    "hash": "content_hash",
+}
+
+
+def _file_brief(row) -> dict:
+    return {
+        "id": row["id"], "source": row["source"], "name": row["name"],
+        "path": row["path"], "size": row["size"], "modified": row["modified"],
+        "content_hash": row["content_hash"], "meta_fingerprint": row["meta_fingerprint"],
+    }
+
+
+def api_duplicates_summary():
+    conn = db()
+    mi.backfill_meta_fingerprints(conn)
+    total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    hashed = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL AND content_hash != ''"
+    ).fetchone()[0]
+    groups = conn.execute(
+        "SELECT COUNT(*) FROM ("
+        "SELECT content_hash FROM files WHERE content_hash IS NOT NULL AND content_hash != '' "
+        "GROUP BY content_hash HAVING COUNT(*) > 1)"
+    ).fetchone()[0]
+    conn.close()
+    return {"total": total, "hashed": hashed, "groups": groups}
+
+
+def api_duplicates(params):
+    mode = params.get("mode", ["name"])[0]
+    if mode not in DUP_MODES:
+        mode = "name"
+    key_expr = DUP_MODES[mode]
+    try:
+        page = max(0, int(params.get("page", ["0"])[0]))
+    except ValueError:
+        page = 0
+    try:
+        limit = min(100, max(1, int(params.get("limit", ["25"])[0])))
+    except ValueError:
+        limit = 25
+    file_id = params.get("file_id", [""])[0].strip()
+
+    conn = db()
+    mi.backfill_meta_fingerprints(conn)
+    anchor = None
+
+    if file_id:
+        row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+        if not row:
+            conn.close()
+            return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit}
+        anchor = _file_brief(row)
+        if mode == "name":
+            key_val = row["name"].lower()
+            key_filter = f"{key_expr} = ?"
+            key_args = [key_val]
+        elif mode == "meta":
+            if not row["meta_fingerprint"]:
+                conn.close()
+                return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit, "anchor": anchor}
+            key_val = row["meta_fingerprint"]
+            key_filter = f"{key_expr} = ?"
+            key_args = [key_val]
+        else:
+            if not row["content_hash"]:
+                conn.close()
+                return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit, "anchor": anchor}
+            key_val = row["content_hash"]
+            key_filter = f"{key_expr} = ?"
+            key_args = [key_val]
+        files = [dict(r) for r in conn.execute(
+            f"SELECT * FROM files WHERE {key_filter} ORDER BY source, name", key_args)]
+        conn.close()
+        if len(files) < 2:
+            return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit, "anchor": anchor}
+        label = key_val if mode != "name" else row["name"]
+        return {
+            "groups": [{
+                "key": key_val, "label": label, "count": len(files),
+                "files": [_file_brief(r) for r in files],
+            }],
+            "total_groups": 1,
+            "page": 0,
+            "page_size": limit,
+            "anchor": anchor,
+        }
+
+    null_guard = f"{key_expr} IS NOT NULL AND {key_expr} != ''"
+    if mode == "name":
+        null_guard = f"{key_expr} IS NOT NULL"
+
+    total_groups = conn.execute(
+        f"SELECT COUNT(*) FROM ("
+        f"SELECT {key_expr} k FROM files WHERE {null_guard} "
+        f"GROUP BY k HAVING COUNT(*) > 1)"
+    ).fetchone()[0]
+
+    keys = [r[0] for r in conn.execute(
+        f"SELECT k FROM ("
+        f"SELECT {key_expr} k, COUNT(*) c FROM files WHERE {null_guard} "
+        f"GROUP BY k HAVING c > 1) ORDER BY c DESC, k LIMIT ? OFFSET ?",
+        (limit, page * limit))]
+
+    groups = []
+    for key_val in keys:
+        if mode == "name":
+            rows = conn.execute(
+                "SELECT * FROM files WHERE LOWER(name) = ? ORDER BY source, name",
+                (key_val,)).fetchall()
+            label = rows[0]["name"] if rows else key_val
+        else:
+            rows = conn.execute(
+                f"SELECT * FROM files WHERE {key_expr} = ? ORDER BY source, name",
+                (key_val,)).fetchall()
+            label = key_val
+        groups.append({
+            "key": key_val,
+            "label": label,
+            "count": len(rows),
+            "files": [_file_brief(r) for r in rows],
+        })
+    conn.close()
+    return {
+        "groups": groups,
+        "total_groups": total_groups,
+        "page": page,
+        "page_size": limit,
+        "anchor": anchor,
+    }
+
+
+def api_scan_start(body):
+    if scan_jobs.job_manager.status()["running"]:
+        return {"ok": False, "error": "A scan is already running"}
+    sources = body.get("sources")
+    if sources == "all" or sources is None:
+        sources = None
+    elif isinstance(sources, str):
+        sources = [sources]
+    ok = scan_jobs.job_manager.start(
+        sources=sources,
+        path_prefix=(body.get("path_prefix") or "").strip(),
+        rescan=bool(body.get("rescan", True)),
+        hash_missing=bool(body.get("hash_missing", True)),
+    )
+    if not ok:
+        return {"ok": False, "error": "Could not start scan"}
+    return {"ok": True}
+
+
+def api_scan_cancel():
+    return {"ok": scan_jobs.job_manager.cancel()}
+
+
+def api_scan_status():
+    return scan_jobs.job_manager.status()
+
+
+def api_trash(session_id: str):
+    items = [{
+        "entry_id": it["entry_id"],
+        "name": it["name"],
+        "source": it["source"],
+        "original_path": it["original_path"],
+        "deleted_at": it["deleted_at"],
+    } for it in file_ops.file_sessions.list_trash(session_id)]
+    return {"items": items}
+
+
+def api_mark_delete(body, session_id: str):
+    conn = db()
+    try:
+        return file_ops.file_sessions.mark_for_deletion(
+            conn, str(body.get("id")), bool(body.get("marked")))
+    finally:
+        conn.close()
+
+
+def api_delete_file(body, session_id: str):
+    conn = db()
+    try:
+        return file_ops.file_sessions.delete_file(conn, session_id, str(body.get("id")))
+    finally:
+        conn.close()
+
+
+def api_restore_file(body, session_id: str):
+    conn = db()
+    try:
+        return file_ops.file_sessions.restore_file(
+            conn, session_id, str(body.get("entry_id")))
+    finally:
+        conn.close()
+
+
+def api_move_file(body, session_id: str):
+    conn = db()
+    try:
+        return file_ops.file_sessions.move_file(
+            conn, str(body.get("id")), (body.get("dest_dir") or "").strip())
+    finally:
+        conn.close()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    session_id = ""
+    session_is_new = False
+
+    def _ensure_session(self):
+        self.session_id, self.session_is_new = file_ops.parse_session_id(
+            self.headers.get("Cookie"))
+
+    def _maybe_set_session_cookie(self):
+        if self.session_is_new:
+            self.send_header(
+                "Set-Cookie",
+                f"indexhub_session={self.session_id}; Path=/; HttpOnly; SameSite=Lax",
+            )
 
     def do_GET(self):
+        self._ensure_session()
         url = urlparse(self.path)
         if url.path == "/":
             self._send(200, LANDING_HTML.encode(), "text/html; charset=utf-8")
         elif url.path in ("/media", "/documents"):
             self._send(200, render_app(url.path[1:]), "text/html; charset=utf-8")
+        elif url.path == "/duplicates":
+            self._send(200, DUPS_HTML.encode(), "text/html; charset=utf-8")
         elif url.path == "/api/stats":
             self._json(api_stats(parse_qs(url.query)))
         elif url.path == "/api/search":
@@ -744,18 +1428,65 @@ class Handler(BaseHTTPRequestHandler):
             self._json(api_suggest(parse_qs(url.query)))
         elif url.path == "/api/file":
             self._serve_file(parse_qs(url.query))
+        elif url.path == "/api/duplicates":
+            self._json(api_duplicates(parse_qs(url.query)))
+        elif url.path == "/api/duplicates/summary":
+            self._json(api_duplicates_summary())
+        elif url.path == "/api/scan/status":
+            self._json(api_scan_status())
+        elif url.path == "/api/trash":
+            self._json(api_trash(self.session_id))
         else:
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
+        self._ensure_session()
         url = urlparse(self.path)
-        if url.path != "/api/rename":
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+        except json.JSONDecodeError:
+            self._json({"ok": False, "error": "Invalid JSON body"})
+            return
+
+        if url.path == "/api/scan/start":
+            self._json(api_scan_start(body))
+            return
+        if url.path == "/api/scan/cancel":
+            self._json(api_scan_cancel())
+            return
+        if url.path == "/api/mark-delete":
+            try:
+                self._json(api_mark_delete(body, self.session_id))
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/delete":
+            try:
+                self._json(api_delete_file(body, self.session_id))
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/restore":
+            try:
+                self._json(api_restore_file(body, self.session_id))
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/move":
+            try:
+                self._json(api_move_file(body, self.session_id))
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path not in ("/api/rename", "/api/reclassify"):
             self._send(404, b"not found", "text/plain")
             return
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length) or b"{}")
-            self._json(api_rename(body))
+            if url.path == "/api/rename":
+                self._json(api_rename(body))
+            else:
+                self._json(api_reclassify(body))
         except ValueError as exc:
             self._json({"ok": False, "error": str(exc)})
         except Exception as exc:  # surface unexpected errors to the UI
@@ -772,8 +1503,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if row["source"] in ("local", "onedrive"):
                 self._stream_local(row["path"], ctype)
-            else:
-                self._stream_gdrive(row, ctype)
+            elif row["source"] in ("gdrive", "qnap"):
+                self._stream_remote(row, ctype)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass  # client cancelled (e.g. video seek); harmless
 
@@ -818,9 +1549,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
 
-    def _stream_gdrive(self, row, ctype):
+    def _stream_remote(self, row, ctype):
         proc = subprocess.Popen(
-            [mi.find_rclone(), "cat", f"{mi.GDRIVE_REMOTE}{row['path']}"],
+            [mi.find_rclone(), "cat", mi.rclone_full_path(row["source"], row["path"])],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
             self.send_response(200)
@@ -836,10 +1567,12 @@ class Handler(BaseHTTPRequestHandler):
     # -- helpers -----------------------------------------------------------------
 
     def _json(self, obj):
-        self._send(200, json.dumps(obj).encode(), "application/json")
+        self._send(200, json.dumps(obj).encode(), "application/json", set_cookie=True)
 
-    def _send(self, code, body, ctype):
+    def _send(self, code, body, ctype, set_cookie=False):
         self.send_response(code)
+        if set_cookie:
+            self._maybe_set_session_cookie()
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
