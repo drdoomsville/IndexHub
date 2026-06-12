@@ -163,6 +163,10 @@ def scan_qnap(cancel_event=None, path_prefix: str = ""):
 
 
 HASH_CHUNK = 1024 * 1024
+# Files at/over this size are skipped by the hash pass (downloading multi-GB
+# files over SMB to hash them is too slow); metadata-duplicate candidates are
+# flagged possible_dupe=1 instead, for manual review.
+HASH_MAX_BYTES = 1_000_000_000
 
 
 def compute_meta_fingerprint(size: int, modified: str, name: str, ext: str, kind: str) -> str:
@@ -575,6 +579,8 @@ def get_db() -> sqlite3.Connection:
         db.execute("ALTER TABLE files ADD COLUMN content_hash TEXT")
     if "marked_delete" not in cols:
         db.execute("ALTER TABLE files ADD COLUMN marked_delete INTEGER NOT NULL DEFAULT 0")
+    if "possible_dupe" not in cols:
+        db.execute("ALTER TABLE files ADD COLUMN possible_dupe INTEGER NOT NULL DEFAULT 0")
     if _is_legacy_unique(db):
         _migrate_files_table(db)
     db.execute("CREATE INDEX IF NOT EXISTS idx_files_device ON files (device_id)")
@@ -755,11 +761,33 @@ def run_scan(db: sqlite3.Connection, source: str, row_iter,
     return count, total
 
 
+def flag_possible_dupes(db: sqlite3.Connection) -> int:
+    """Recompute possible_dupe: unhashed files at/over HASH_MAX_BYTES whose
+    metadata fingerprint collides with another file. These are excluded from
+    the hash pass and left for manual review."""
+    db.execute("UPDATE files SET possible_dupe = 0 WHERE possible_dupe != 0")
+    cur = db.execute(
+        """
+        UPDATE files SET possible_dupe = 1
+        WHERE size >= ?
+          AND (content_hash IS NULL OR content_hash = '')
+          AND meta_fingerprint IN (
+            SELECT meta_fingerprint FROM files
+            WHERE meta_fingerprint IS NOT NULL AND meta_fingerprint != ''
+            GROUP BY meta_fingerprint HAVING COUNT(*) > 1)
+        """, (HASH_MAX_BYTES,))
+    db.commit()
+    return cur.rowcount
+
+
 def run_hash_pass(db: sqlite3.Connection, sources: list[str] | None = None,
                   path_prefix: str = "", missing_only: bool = True,
                   cancel_event=None, progress_cb=None) -> int:
-    where = ["1=1"]
-    args: list = []
+    flagged = flag_possible_dupes(db)
+    print(f"  [hash] {flagged:,} files >= {HASH_MAX_BYTES / 1e9:.0f} GB flagged "
+          "as possible duplicates (skipped from hashing)", flush=True)
+    where = ["(size IS NULL OR size < ?)"]
+    args: list = [HASH_MAX_BYTES]
     if missing_only:
         where.append("(content_hash IS NULL OR content_hash = '')")
     if sources:

@@ -727,7 +727,9 @@ for (const domain of ["media", "documents"]) {
 fetch("/api/duplicates/summary").then(r => r.json()).then(s => {
   document.getElementById("dup-stats").innerHTML =
     `<b>${s.groups.toLocaleString()}</b> duplicate groups \u00b7 ` +
-    `<span style="font-size:12.5px">${s.hashed.toLocaleString()} hashed / ${s.total.toLocaleString()} indexed</span>`;
+    `<span style="font-size:12.5px">${s.hashed.toLocaleString()} hashed / ${s.total.toLocaleString()} indexed` +
+    (s.possible ? ` \u00b7 ${s.possible.toLocaleString()} large files for manual review` : "") +
+    `</span>`;
 }).catch(() => {
   document.getElementById("dup-stats").textContent = "Open to scan for duplicates";
 });
@@ -815,6 +817,7 @@ DUPS_HTML = """<!DOCTYPE html>
   button:hover:not(:disabled) { border-color:var(--accent); }
   button:disabled { opacity:.4; cursor:default; }
   .anchor { background:#233252; border:1px solid #3a5080; border-radius:8px; padding:10px 14px; margin-bottom:14px; font-size:13px; }
+  .flag { background:#4a3520; color:#f0b35e; border-radius:6px; padding:1px 7px; font-size:11px; white-space:nowrap; }
 </style>
 </head>
 <body>
@@ -862,7 +865,7 @@ async function load() {
       <div class="group-h"><b>${g.count} files</b> \u00b7 ${esc(g.label)}</div>
       <table><thead><tr><th>Name</th><th>Source</th><th>Size</th><th>Modified</th><th>Path</th></tr></thead>
       <tbody>${g.files.map(f => `<tr>
-        <td>${esc(f.name)}</td><td>${esc(f.source)}</td><td>${fmtSize(f.size)}</td>
+        <td>${esc(f.name)}${f.possible_dupe ? ' <span class="flag">&ge;1 GB &middot; not hashed</span>' : ""}</td><td>${esc(f.source)}</td><td>${fmtSize(f.size)}</td>
         <td>${f.modified ? esc(f.modified.slice(0,10)) : ""}</td>
         <td class="path">${esc(f.path)}</td></tr>`).join("")}</tbody></table>
     </div>`).join("") : `<div class="empty">No duplicate groups found for this mode.</div>`;
@@ -1197,6 +1200,7 @@ def _file_brief(row) -> dict:
         "id": row["id"], "source": row["source"], "name": row["name"],
         "path": row["path"], "size": row["size"], "modified": row["modified"],
         "content_hash": row["content_hash"], "meta_fingerprint": row["meta_fingerprint"],
+        "possible_dupe": row["possible_dupe"],
     }
 
 
@@ -1212,8 +1216,10 @@ def api_duplicates_summary():
         "SELECT content_hash FROM files WHERE content_hash IS NOT NULL AND content_hash != '' "
         "GROUP BY content_hash HAVING COUNT(*) > 1)"
     ).fetchone()[0]
+    possible = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE possible_dupe = 1").fetchone()[0]
     conn.close()
-    return {"total": total, "hashed": hashed, "groups": groups}
+    return {"total": total, "hashed": hashed, "groups": groups, "possible": possible}
 
 
 def api_duplicates(params):
