@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 from datetime import datetime
@@ -1896,6 +1897,31 @@ def api_delete_batch(body, session_id: str):
             "requested": len(ids)}
 
 
+def api_ingest(body, token_ok: bool):
+    """Accept a remote machine's local-file inventory and upsert it into the
+    shared index, tagged with that machine's identity. Used by `media_index.py
+    push` running on another computer (e.g. a laptop)."""
+    if not token_ok:
+        return {"ok": False, "error": "Invalid or missing ingest token"}
+    device_id = (body.get("device_id") or "").strip()
+    device_label = (body.get("device_label") or "").strip()
+    source = body.get("source")
+    files = body.get("files")
+    if source not in ("local", "onedrive"):
+        return {"ok": False, "error": "source must be 'local' or 'onedrive'"}
+    if not device_id:
+        return {"ok": False, "error": "device_id is required"}
+    if not isinstance(files, list):
+        return {"ok": False, "error": "files must be a list"}
+    conn = db()
+    try:
+        count = mi.ingest_rows(conn, source, device_id, device_label, files)
+    finally:
+        conn.close()
+    return {"ok": True, "count": count, "device_id": device_id,
+            "device_label": device_label}
+
+
 def api_restore_file(body, session_id: str):
     conn = db()
     try:
@@ -2019,6 +2045,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_delete_batch(body, self.session_id))
             except ValueError as exc:
                 self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/ingest":
+            expected = os.environ.get("INDEXHUB_TOKEN")
+            token_ok = (not expected) or (self.headers.get("X-IndexHub-Token") == expected)
+            try:
+                self._json(api_ingest(body, token_ok))
+            except Exception as exc:
+                self._json({"ok": False, "error": f"Ingest failed: {exc}"})
             return
         if url.path == "/api/restore":
             try:
@@ -2153,9 +2187,18 @@ class Server(ThreadingHTTPServer):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="bind address; use 0.0.0.0 to let other machines "
+                        "on your network reach this server")
     args = parser.parse_args()
-    server = Server(("127.0.0.1", args.port), Handler)
+    server = Server((args.host, args.port), Handler)
     print(f"Media Index UI running at http://localhost:{args.port}  (Ctrl+C to stop)")
+    if args.host == "0.0.0.0":
+        ip = socket.gethostbyname(socket.gethostname())
+        print(f"  Reachable from other machines on your LAN at http://{ip}:{args.port}")
+        if not os.environ.get("INDEXHUB_TOKEN"):
+            print("  NOTE: no INDEXHUB_TOKEN set — any machine on your LAN can push "
+                  "to /api/ingest. Set INDEXHUB_TOKEN to require a shared secret.")
     server.serve_forever()
 
 

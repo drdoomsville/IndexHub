@@ -19,6 +19,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -786,6 +788,60 @@ def run_scan(db: sqlite3.Connection, source: str, row_iter,
     return count, total
 
 
+def ingest_rows(db: sqlite3.Connection, source: str, device_id: str,
+                device_label: str, files: list) -> int:
+    """Upsert a remote machine's file inventory for `source` into the shared
+    index, tagged with that machine's identity. Existing content hashes are
+    preserved unless the incoming row supplies one; rows for this device that
+    are absent from the new inventory are removed (so deletions propagate).
+
+    Each item in `files` is a dict with keys: path, name, ext, kind, size,
+    modified, category, and optionally content_hash."""
+    scanned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    insert_sql = (
+        "INSERT OR REPLACE INTO files "
+        "(source, path, name, ext, kind, size, modified, category, "
+        "device_id, device_label, scanned_at, meta_fingerprint, content_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "COALESCE(?, (SELECT content_hash FROM files "
+        "WHERE source=? AND device_id=? AND path=?)))")
+    batch = []
+    count = 0
+    total = 0
+    for f in files:
+        path = f["path"]
+        name = f["name"]
+        ext = f.get("ext", "")
+        kind = f["kind"]
+        size = int(f.get("size") or 0)
+        modified = f.get("modified") or ""
+        category = f.get("category")
+        chash = f.get("content_hash") or None
+        meta = compute_meta_fingerprint(size, modified, name, ext, kind)
+        batch.append((source, path, name, ext, kind, size, modified, category,
+                      device_id, device_label, scanned_at, meta,
+                      chash, source, device_id, path))
+        count += 1
+        total += max(size, 0)
+        if len(batch) >= 5000:
+            db.executemany(insert_sql, batch)
+            batch.clear()
+            db.commit()
+    if batch:
+        db.executemany(insert_sql, batch)
+    # Drop rows for this device+source not present in this push (deletions).
+    db.execute(
+        "DELETE FROM files WHERE source = ? AND device_id = ? AND scanned_at < ?",
+        (source, device_id, scanned_at))
+    db.execute(
+        "INSERT INTO scans (source, started_at, finished_at, file_count, total_bytes) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (source, scanned_at,
+         datetime.now(timezone.utc).isoformat(timespec="seconds"), count, total))
+    db.commit()
+    return count
+
+
 def flag_possible_dupes(db: sqlite3.Connection) -> int:
     """Recompute possible_dupe: unhashed files at/over HASH_MAX_BYTES whose
     metadata fingerprint collides with another file. These are excluded from
@@ -942,6 +998,51 @@ def cmd_scan(args):
         print(f"  Hashed {totals['hashed']:,} files")
 
 
+def cmd_push(args):
+    """Walk this machine's local files and push them to a remote IndexHub
+    server's shared index (this machine keeps no database of its own)."""
+    server = args.server.rstrip("/")
+    source = args.source
+    device_id, device_label = get_machine_identity()
+    print(f"Collecting {source} files on this machine ({device_label})...", flush=True)
+    files = []
+    for path, name, ext, kind, size, modified, category in iter_source_rows(source):
+        rec = {"path": path, "name": name, "ext": ext, "kind": kind,
+               "size": size, "modified": modified, "category": category}
+        if args.hash:
+            digest = hash_local_file(path)
+            if digest:
+                rec["content_hash"] = digest
+        files.append(rec)
+        if len(files) % 1000 == 0:
+            print(f"  {len(files):,} files{' (hashed)' if args.hash else ''}...", flush=True)
+    print(f"Collected {len(files):,} files. Pushing to {server} ...", flush=True)
+    payload = json.dumps({
+        "device_id": device_id, "device_label": device_label,
+        "source": source, "files": files,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{server}/api/ingest", data=payload,
+        headers={"Content-Type": "application/json"})
+    token = os.environ.get("INDEXHUB_TOKEN")
+    if token:
+        req.add_header("X-IndexHub-Token", token)
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        print(f"Push failed: HTTP {exc.code} {exc.read().decode()[:200]}", file=sys.stderr)
+        return
+    except urllib.error.URLError as exc:
+        print(f"Push failed: cannot reach {server} ({exc.reason})", file=sys.stderr)
+        return
+    if result.get("ok"):
+        print(f"Pushed {result['count']:,} {source} files to the shared index "
+              f"as '{device_label}'.")
+    else:
+        print(f"Push rejected: {result.get('error')}", file=sys.stderr)
+
+
 def cmd_search(args):
     db = get_db()
     sql = ("SELECT source, device_label, kind, category, size, modified, path "
@@ -1042,6 +1143,18 @@ def main():
 
     p_stats = sub.add_parser("stats", help="show index statistics")
     p_stats.set_defaults(func=cmd_stats)
+
+    p_push = sub.add_parser(
+        "push", help="send this machine's local files to a remote IndexHub "
+        "server (use on a laptop that shares the desktop's index)")
+    p_push.add_argument("--server", required=True,
+                        help="IndexHub server URL, e.g. http://192.168.50.50:8765")
+    p_push.add_argument("--source", default="local", choices=["local", "onedrive"],
+                        help="which local source to push (default: local)")
+    p_push.add_argument("--hash", action="store_true",
+                        help="compute content hashes locally first "
+                        "(enables exact-duplicate detection for these files)")
+    p_push.set_defaults(func=cmd_push)
 
     args = parser.parse_args()
     args.func(args)
