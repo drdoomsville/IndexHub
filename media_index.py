@@ -113,6 +113,24 @@ def rclone_full_path(source: str, rel_path: str) -> str:
     raise ValueError(f"not a remote source: {source}")
 
 
+def reveal_path(source: str, rel_path: str) -> str | None:
+    """Return a Windows filesystem path that Explorer can select for this row,
+    or None if the source can't be browsed locally (e.g. Google Drive).
+
+    local/onedrive rows are already absolute paths; qnap rows are SMB-relative
+    and become a UNC path \\\\host\\share\\rel."""
+    if source in ("local", "onedrive"):
+        return os.path.normpath(rel_path)
+    if source == "qnap":
+        cfg = load_qnap_config()
+        if not cfg:
+            return None
+        share = (cfg.get("share") or "Public").strip("/\\")
+        rel = rel_path.replace("/", "\\").lstrip("\\")
+        return f"\\\\{cfg['host']}\\{share}\\{rel}"
+    return None
+
+
 def scan_qnap(cancel_event=None, path_prefix: str = ""):
     """Yield media file rows from QNAP via rclone SMB lsf (streaming)."""
     cfg = load_qnap_config()

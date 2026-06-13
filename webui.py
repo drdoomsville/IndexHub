@@ -232,6 +232,7 @@ APP_HTML = """<!DOCTYPE html>
       </div>
       <button id="dupBtn" type="button" style="width:100%;margin-bottom:12px">Check duplicates</button>
       <div class="renlbl">File actions</div>
+      <button id="revealBtn" type="button" style="width:100%;margin-bottom:8px">&#128193; Open folder in Explorer</button>
       <label class="mark-row"><input type="checkbox" id="markDelete"> Mark for deletion</label>
       <input id="moveDest" placeholder="Move to folder (full path)" spellcheck="false">
       <button id="moveBtn" type="button" style="width:100%;margin-bottom:8px">Move file</button>
@@ -514,6 +515,22 @@ $("markDelete").addEventListener("change", async () => {
     $("opsmsg").className = "opsmsg err";
   }
 });
+$("revealBtn").onclick = async () => {
+  if (!sel) return;
+  $("opsmsg").textContent = "Opening folder\u2026";
+  $("opsmsg").className = "opsmsg";
+  const res = await (await fetch("/api/reveal", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({id: sel.id}),
+  })).json();
+  if (res.ok) {
+    $("opsmsg").textContent = "Opened in Explorer \u2713";
+    $("opsmsg").className = "opsmsg ok";
+  } else {
+    $("opsmsg").textContent = res.error || "Open folder failed";
+    $("opsmsg").className = "opsmsg err";
+  }
+};
 $("moveBtn").onclick = async () => {
   if (!sel) return;
   $("opsmsg").textContent = "Moving\u2026";
@@ -818,6 +835,14 @@ DUPS_HTML = """<!DOCTYPE html>
   button:disabled { opacity:.4; cursor:default; }
   .anchor { background:#233252; border:1px solid #3a5080; border-radius:8px; padding:10px 14px; margin-bottom:14px; font-size:13px; }
   .flag { background:#4a3520; color:#f0b35e; border-radius:6px; padding:1px 7px; font-size:11px; white-space:nowrap; }
+  .filters { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }
+  .filters input[type=text], .filters select { background:var(--panel2); color:var(--text);
+    border:1px solid #2c3344; border-radius:8px; padding:7px 10px; font-size:13px; }
+  .filters input[type=text] { min-width:220px; flex:1 1 220px; }
+  .filters label { color:var(--muted); font-size:13px; display:flex; align-items:center; gap:6px; }
+  .reveal-btn { background:var(--panel2); border:1px solid #2c3344; border-radius:7px;
+    padding:4px 10px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  .reveal-btn:hover { border-color:var(--accent); color:var(--accent); }
 </style>
 </head>
 <body>
@@ -829,6 +854,25 @@ DUPS_HTML = """<!DOCTYPE html>
     <button data-mode="name" class="active">Filename</button>
     <button data-mode="meta">Metadata</button>
     <button data-mode="hash">Content hash</button>
+  </div>
+  <div class="filters">
+    <input type="text" id="fq" placeholder="Search name or path…" spellcheck="false">
+    <select id="fsource">
+      <option value="">All sources</option>
+      <option value="local">Local</option>
+      <option value="onedrive">OneDrive</option>
+      <option value="gdrive">Google Drive</option>
+      <option value="qnap">QNAP NAS</option>
+    </select>
+    <select id="fsize">
+      <option value="0">Any size</option>
+      <option value="10000000">&ge; 10 MB</option>
+      <option value="100000000">&ge; 100 MB</option>
+      <option value="500000000">&ge; 500 MB</option>
+      <option value="1000000000">&ge; 1 GB</option>
+    </select>
+    <label><input type="checkbox" id="fpossible"> Large files for review only</label>
+    <button id="freset" type="button">Reset</button>
   </div>
   <div id="anchor" hidden></div>
   <div id="groups"></div>
@@ -852,6 +896,12 @@ function fmtSize(n) {
 async function load() {
   const p = new URLSearchParams({mode, page, limit: 25});
   if (fileId) p.set("file_id", fileId);
+  if (!fileId) {
+    if ($("fq").value.trim()) p.set("q", $("fq").value.trim());
+    if ($("fsource").value) p.set("source", $("fsource").value);
+    if ($("fsize").value !== "0") p.set("min_size", $("fsize").value);
+    if ($("fpossible").checked) p.set("possible", "1");
+  }
   const d = await (await fetch("/api/duplicates?" + p)).json();
   if (d.anchor) {
     $("anchor").hidden = false;
@@ -863,17 +913,38 @@ async function load() {
   $("groups").innerHTML = d.groups.length ? d.groups.map(g => `
     <div class="group">
       <div class="group-h"><b>${g.count} files</b> \u00b7 ${esc(g.label)}</div>
-      <table><thead><tr><th>Name</th><th>Source</th><th>Size</th><th>Modified</th><th>Path</th></tr></thead>
+      <table><thead><tr><th>Name</th><th>Source</th><th>Size</th><th>Modified</th><th>Path</th><th></th></tr></thead>
       <tbody>${g.files.map(f => `<tr>
         <td>${esc(f.name)}${f.possible_dupe ? ' <span class="flag">&ge;1 GB &middot; not hashed</span>' : ""}</td><td>${esc(f.source)}</td><td>${fmtSize(f.size)}</td>
         <td>${f.modified ? esc(f.modified.slice(0,10)) : ""}</td>
-        <td class="path">${esc(f.path)}</td></tr>`).join("")}</tbody></table>
-    </div>`).join("") : `<div class="empty">No duplicate groups found for this mode.</div>`;
+        <td class="path">${esc(f.path)}</td>
+        <td><button class="reveal-btn" data-reveal="${f.id}" title="Open containing folder in Explorer">&#128193; Open folder</button></td></tr>`).join("")}</tbody></table>
+    </div>`).join("") : `<div class="empty">No duplicate groups found for this filter.</div>`;
   const pages = Math.max(1, Math.ceil(d.total_groups / d.page_size));
   $("pageinfo").textContent = `${d.total_groups.toLocaleString()} group(s) \u00b7 page ${page + 1} of ${pages}`;
   $("prev").disabled = page === 0;
   $("next").disabled = page >= pages - 1;
 }
+$("groups").addEventListener("click", async e => {
+  const btn = e.target.closest("[data-reveal]");
+  if (!btn) return;
+  const orig = btn.textContent;
+  btn.textContent = "Opening\u2026"; btn.disabled = true;
+  const res = await (await fetch("/api/reveal", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({id: +btn.dataset.reveal}),
+  })).json();
+  if (!res.ok) alert(res.error || "Open folder failed");
+  btn.textContent = orig; btn.disabled = false;
+});
+let ft;
+$("fq").addEventListener("input", () => { clearTimeout(ft); ft = setTimeout(() => { page = 0; load(); }, 300); });
+["fsource", "fsize", "fpossible"].forEach(id =>
+  $(id).addEventListener("change", () => { page = 0; load(); }));
+$("freset").onclick = () => {
+  $("fq").value = ""; $("fsource").value = ""; $("fsize").value = "0"; $("fpossible").checked = false;
+  page = 0; load();
+};
 document.querySelectorAll(".tabs button").forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll(".tabs button").forEach(b => b.classList.remove("active"));
@@ -1222,6 +1293,33 @@ def api_duplicates_summary():
     return {"total": total, "hashed": hashed, "groups": groups, "possible": possible}
 
 
+def _dup_filters(params):
+    """Build extra WHERE conditions for the duplicate-group queries from the
+    filter params. Returns (sql_fragment, args); the fragment begins with
+    ' AND ...' so it can be appended to an existing WHERE."""
+    where, args = [], []
+    q = params.get("q", [""])[0].strip()
+    source = params.get("source", [""])[0]
+    possible = params.get("possible", [""])[0]
+    try:
+        min_size = int(params.get("min_size", ["0"])[0])
+    except ValueError:
+        min_size = 0
+    if q:
+        where.append("(name LIKE ? OR path LIKE ?)")
+        args += [f"%{q}%", f"%{q}%"]
+    if source in ("local", "onedrive", "gdrive", "qnap"):
+        where.append("source = ?")
+        args.append(source)
+    if min_size > 0:
+        where.append("size >= ?")
+        args.append(min_size)
+    if possible == "1":
+        where.append("possible_dupe = 1")
+    frag = ("".join(f" AND {c}" for c in where))
+    return frag, args
+
+
 def api_duplicates(params):
     mode = params.get("mode", ["name"])[0]
     if mode not in DUP_MODES:
@@ -1286,29 +1384,32 @@ def api_duplicates(params):
     if mode == "name":
         null_guard = f"{key_expr} IS NOT NULL"
 
+    frag, frag_args = _dup_filters(params)
+    where_full = null_guard + frag
+
     total_groups = conn.execute(
         f"SELECT COUNT(*) FROM ("
-        f"SELECT {key_expr} k FROM files WHERE {null_guard} "
-        f"GROUP BY k HAVING COUNT(*) > 1)"
+        f"SELECT {key_expr} k FROM files WHERE {where_full} "
+        f"GROUP BY k HAVING COUNT(*) > 1)", frag_args
     ).fetchone()[0]
 
     keys = [r[0] for r in conn.execute(
         f"SELECT k FROM ("
-        f"SELECT {key_expr} k, COUNT(*) c FROM files WHERE {null_guard} "
+        f"SELECT {key_expr} k, COUNT(*) c FROM files WHERE {where_full} "
         f"GROUP BY k HAVING c > 1) ORDER BY c DESC, k LIMIT ? OFFSET ?",
-        (limit, page * limit))]
+        frag_args + [limit, page * limit])]
 
     groups = []
     for key_val in keys:
         if mode == "name":
             rows = conn.execute(
-                "SELECT * FROM files WHERE LOWER(name) = ? ORDER BY source, name",
-                (key_val,)).fetchall()
+                f"SELECT * FROM files WHERE LOWER(name) = ?{frag} ORDER BY source, name",
+                [key_val] + frag_args).fetchall()
             label = rows[0]["name"] if rows else key_val
         else:
             rows = conn.execute(
-                f"SELECT * FROM files WHERE {key_expr} = ? ORDER BY source, name",
-                (key_val,)).fetchall()
+                f"SELECT * FROM files WHERE {key_expr} = ?{frag} ORDER BY source, name",
+                [key_val] + frag_args).fetchall()
             label = key_val
         groups.append({
             "key": key_val,
@@ -1399,6 +1500,21 @@ def api_move_file(body, session_id: str):
         conn.close()
 
 
+def api_reveal(body):
+    """Open the containing folder in Windows Explorer with the file selected."""
+    row = get_file_row(body.get("id"))
+    if not row:
+        return {"ok": False, "error": "File not found in index"}
+    target = mi.reveal_path(row["source"], row["path"])
+    if not target:
+        label = "Google Drive" if row["source"] == "gdrive" else row["source"]
+        return {"ok": False, "error": f"Open folder is not available for {label} files"}
+    # explorer.exe returns a non-zero exit code even on success, so fire and
+    # forget. /select, highlights the file inside its folder.
+    subprocess.Popen(["explorer", f"/select,{target}"])
+    return {"ok": True, "path": target}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     session_id = ""
@@ -1484,6 +1600,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_move_file(body, self.session_id))
             except ValueError as exc:
                 self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/reveal":
+            try:
+                self._json(api_reveal(body))
+            except Exception as exc:
+                self._json({"ok": False, "error": f"Open folder failed: {exc}"})
             return
         if url.path not in ("/api/rename", "/api/reclassify"):
             self._send(404, b"not found", "text/plain")
