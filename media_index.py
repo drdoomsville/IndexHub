@@ -125,8 +125,15 @@ def reveal_path(source: str, rel_path: str) -> str | None:
         cfg = load_qnap_config()
         if not cfg:
             return None
-        share = (cfg.get("share") or "Public").strip("/\\")
         rel = rel_path.replace("/", "\\").lstrip("\\")
+        # Prefer a mapped network drive (e.g. Z:) if the share root is mounted
+        # locally — Explorer opens it instantly with no credential prompt.
+        drive = (cfg.get("mapped_drive") or "").strip().rstrip("\\")
+        if drive:
+            if not drive.endswith(":"):
+                drive += ":"
+            return f"{drive}\\{rel}"
+        share = (cfg.get("share") or "Public").strip("/\\")
         return f"\\\\{cfg['host']}\\{share}\\{rel}"
     return None
 
