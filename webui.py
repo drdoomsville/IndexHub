@@ -1039,8 +1039,8 @@ async function deleteSelected() {
   $("delSel").textContent = "Delete selected";
   if (res.ok) {
     if (res.failed && res.failed.length)
-      alert(`Deleted ${res.deleted} of ${res.requested}. ${res.failed.length} failed:\n` +
-            res.failed.slice(0, 6).map(f => "\u2022 " + f.error).join("\n"));
+      alert(`Deleted ${res.deleted} of ${res.requested}. ${res.failed.length} failed:\\n` +
+            res.failed.slice(0, 6).map(f => "\u2022 " + f.error).join("\\n"));
     loadTrash(); load();
   } else { alert(res.error || "Batch delete failed"); $("delSel").disabled = false; }
 }
