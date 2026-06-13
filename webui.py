@@ -1703,6 +1703,9 @@ class Handler(BaseHTTPRequestHandler):
             self._maybe_set_session_cookie()
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # Pages and API responses are generated fresh each load; never let a
+        # browser serve a stale copy (e.g. an old page without a new button).
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
