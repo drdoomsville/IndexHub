@@ -289,7 +289,7 @@ function dirOf(path) {
 }
 
 async function loadStats() {
-  const s = await (await fetch("/api/stats?domain=" + PAGE.domain)).json();
+  const s = await IH.cachedFetch("/api/stats?domain=" + PAGE.domain);
   const cats = Object.entries(s.categories)
     .map(([c, n]) => `${n.toLocaleString()} ${c}`).join(" / ");
   $("sub").textContent =
@@ -322,7 +322,7 @@ async function updateFacets() {
     domain: PAGE.domain, q: $("q").value, kind: $("kind").value,
     source: $("source").value, machine: $("machine").value, year: $("year").value,
   });
-  const f = await (await fetch("/api/facets?" + p)).json();
+  const f = await IH.cachedFetch("/api/facets?" + p);
   setOptions($("kind"), KIND_OPTS.map(([v, l]) => ({
     value: v, label: l,
     count: !v ? null
@@ -363,7 +363,7 @@ async function search() {
     source: $("source").value, machine: $("machine").value,
     year: $("year").value, sort: $("sort").value, page,
   });
-  const d = await (await fetch("/api/search?" + p)).json();
+  const d = await IH.cachedFetch("/api/search?" + p);
   total = d.total;
   lastRows = d.rows;
   $("rows").innerHTML = d.rows.length ? d.rows.map((r, i) => `<tr data-i="${i}"
@@ -382,6 +382,15 @@ async function search() {
     `${total.toLocaleString()} result(s) \u00b7 page ${page + 1} of ${pages}`;
   $("prev").disabled = page === 0;
   $("next").disabled = page >= pages - 1;
+  saveMediaState();
+}
+
+function saveMediaState() {
+  IH.saveState("media-" + PAGE.domain, {
+    q: $("q").value, kind: $("kind").value, source: $("source").value,
+    machine: $("machine").value, year: $("year").value, sort: $("sort").value,
+    page, scrollY: window.scrollY,
+  });
 }
 
 async function openPanel(r) {
@@ -470,6 +479,7 @@ async function reclassify(category) {
         `<b>${esc(res.category)}</b> \u00b7 ${fmtSize(sel.size)} \u00b7 ` +
         `${sel.modified ? esc(sel.modified.slice(0,10)) : "no date"} \u00b7 ${esc(sel.source)} \u00b7 ${esc(sel.device_label || "-")}<br>` +
         `${esc(sel.path)}`;
+      IH.bustCache();
       search();
       updateFacets();
     } else {
@@ -511,7 +521,7 @@ $("trashList").addEventListener("click", async e => {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({entry_id: id}),
   })).json();
-  if (res.ok) { loadTrash(); search(); updateFacets(); loadStats(); }
+  if (res.ok) { IH.bustCache(); loadTrash(); search(); updateFacets(); loadStats(); }
   else alert(res.error || "Restore failed");
 });
 $("markDelete").addEventListener("change", async () => {
@@ -522,6 +532,7 @@ $("markDelete").addEventListener("change", async () => {
   })).json();
   if (res.ok) {
     sel.marked_delete = res.marked_delete;
+    IH.bustCache();
     search();
   } else {
     $("markDelete").checked = ! $("markDelete").checked;
@@ -558,6 +569,7 @@ $("moveBtn").onclick = async () => {
     $("fname").textContent = res.name;
     $("opsmsg").textContent = "Moved \u2713";
     $("opsmsg").className = "opsmsg ok";
+    IH.bustCache();
     search();
   } else {
     $("opsmsg").textContent = res.error || "Move failed";
@@ -574,6 +586,7 @@ $("deleteBtn").onclick = async () => {
     body: JSON.stringify({id: sel.id}),
   })).json();
   if (res.ok) {
+    IH.bustCache();
     closePanel();
     loadTrash();
     search();
@@ -603,6 +616,7 @@ $("renameBtn").onclick = async () => {
       $("fname").textContent = res.name;
       $("renamemsg").textContent = "Renamed \u2713";
       $("renamemsg").className = "ok";
+      IH.bustCache();
       search();
     } else {
       $("renamemsg").textContent = res.error || "Rename failed";
@@ -630,15 +644,27 @@ $("next").onclick = () => { page++; search(); };
 setOptions($("kind"), KIND_OPTS.map(([v, l]) => ({value: v, label: l, count: null})));
 setOptions($("source"), SOURCE_OPTS.map(([v, l]) => ({value: v, label: l, count: null})));
 setOptions($("machine"), [{value: "", label: "All machines", count: null}]);
+// Restore the filters/scroll from the last visit so switching pages and coming
+// back doesn't reset everything.
+const _st = IH.loadState("media-" + PAGE.domain) || {};
+if (_st.q) $("q").value = _st.q;
+if (_st.kind) $("kind").value = _st.kind;
+if (_st.source) $("source").value = _st.source;
+if (_st.machine) $("machine").value = _st.machine;
+if (_st.year) $("year").value = _st.year;
+if (_st.sort) $("sort").value = _st.sort;
+if (typeof _st.page === "number") page = _st.page;
 // Deep-link support: /media?q=...&source=... (used by the duplicate checker's
-// "Library" jump) pre-fills the filters so you land on the file.
+// "Library" jump) pre-fills the filters so you land on the file. It overrides
+// any restored state and resets pagination.
 const _initP = new URLSearchParams(location.search);
-if (_initP.get("q")) $("q").value = _initP.get("q");
-if (_initP.get("source")) $("source").value = _initP.get("source");
+if (_initP.get("q")) { $("q").value = _initP.get("q"); page = 0; }
+if (_initP.get("source")) { $("source").value = _initP.get("source"); page = 0; }
 loadStats();
 updateFacets();
-search();
+search().then(() => { if (_st.scrollY) window.scrollTo(0, _st.scrollY); });
 loadTrash();
+window.addEventListener("beforeunload", saveMediaState);
 </script>
 </body>
 </html>
@@ -759,7 +785,7 @@ function fmtSize(n) {
   return n.toLocaleString(undefined, {maximumFractionDigits: 1}) + " " + u[i];
 }
 for (const domain of ["media", "documents"]) {
-  fetch("/api/stats?domain=" + domain).then(r => r.json()).then(s => {
+  IH.cachedFetch("/api/stats?domain=" + domain).then(s => {
     const cats = Object.entries(s.categories)
       .map(([c, n]) => `${n.toLocaleString()} ${c}`).join(" \u00b7 ");
     document.getElementById(domain + "-stats").innerHTML =
@@ -767,7 +793,7 @@ for (const domain of ["media", "documents"]) {
       `<span style="font-size:12.5px">${cats || "&nbsp;"}</span>`;
   });
 }
-fetch("/api/duplicates/summary").then(r => r.json()).then(s => {
+IH.cachedFetch("/api/duplicates/summary").then(s => {
   document.getElementById("dup-stats").innerHTML =
     `<b>${s.groups.toLocaleString()}</b> duplicate groups \u00b7 ` +
     `<span style="font-size:12.5px">${s.hashed.toLocaleString()} hashed / ${s.total.toLocaleString()} indexed` +
@@ -776,7 +802,7 @@ fetch("/api/duplicates/summary").then(r => r.json()).then(s => {
 }).catch(() => {
   document.getElementById("dup-stats").textContent = "Open to scan for duplicates";
 });
-fetch("/api/duplicates/report").then(r => r.json()).then(d => {
+IH.cachedFetch("/api/duplicates/report").then(d => {
   document.getElementById("report-stats").innerHTML =
     `<b>${fmtSize(d.reclaim)}</b> reclaimable · ` +
     `<span style="font-size:12.5px">${d.redundant.toLocaleString()} removable copies in ${d.groups.toLocaleString()} groups</span>`;
@@ -804,7 +830,7 @@ async function refreshScanStatus() {
   } else {
     el.textContent = "Idle";
   }
-  if (!s.running && scanPoll) { clearInterval(scanPoll); scanPoll = null; }
+  if (!s.running && scanPoll) { clearInterval(scanPoll); scanPoll = null; IH.bustCache(); }
 }
 document.getElementById("scanStart").onclick = async () => {
   const scope = document.getElementById("scanScope").value;
@@ -977,7 +1003,7 @@ async function load() {
     if ($("fsize").value !== "0") p.set("min_size", $("fsize").value);
     if ($("fpossible").checked) p.set("possible", "1");
   }
-  const d = await (await fetch("/api/duplicates?" + p)).json();
+  const d = await IH.cachedFetch("/api/duplicates?" + p);
   if (d.anchor) {
     $("anchor").hidden = false;
     $("anchor").innerHTML = `Showing duplicates for <b>${esc(d.anchor.name)}</b> (${esc(d.anchor.source)}) \u00b7 ` +
@@ -1006,6 +1032,15 @@ async function load() {
   $("prev").disabled = page === 0;
   $("next").disabled = page >= pages - 1;
   updateSelInfo();
+  saveDupState();
+}
+function saveDupState() {
+  IH.saveState("dups", {
+    mode, page, batch, fileId,
+    fq: $("fq").value, fsource: $("fsource").value,
+    fsize: $("fsize").value, fpossible: $("fpossible").checked,
+    scrollY: window.scrollY,
+  });
 }
 // ---- batch selection ----
 function pathDepth(p) { return (p.match(/[\\\\/]/g) || []).length; }
@@ -1055,7 +1090,7 @@ async function deleteSelected() {
     if (res.failed && res.failed.length)
       alert(`Deleted ${res.deleted} of ${res.requested}. ${res.failed.length} failed:\\n` +
             res.failed.slice(0, 6).map(f => "\u2022 " + f.error).join("\\n"));
-    loadTrash(); load();
+    IH.bustCache(); loadTrash(); load();
   } else { alert(res.error || "Batch delete failed"); $("delSel").disabled = false; }
 }
 $("batchToggle").onclick = () => {
@@ -1094,7 +1129,7 @@ $("groups").addEventListener("click", async e => {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({id: +del.dataset.del}),
     })).json();
-    if (res.ok) { loadTrash(); load(); }
+    if (res.ok) { IH.bustCache(); loadTrash(); load(); }
     else { alert(res.error || "Delete failed"); del.disabled = false; del.textContent = "Delete"; }
   }
 });
@@ -1118,7 +1153,7 @@ $("trashList").addEventListener("click", async e => {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({entry_id: b.dataset.restore}),
   })).json();
-  if (res.ok) { loadTrash(); load(); }
+  if (res.ok) { IH.bustCache(); loadTrash(); load(); }
   else { alert(res.error || "Restore failed"); b.disabled = false; }
 });
 let ft;
@@ -1141,8 +1176,26 @@ document.querySelectorAll(".tabs button").forEach(btn => {
 $("prev").onclick = () => { page--; load(); };
 $("next").onclick = () => { page++; load(); };
 if (params.get("mode")) mode = params.get("mode");
-load();
+// Restore the last view (mode, filters, batch toggle, scroll) unless the URL
+// carries an explicit anchor/mode deep-link, which always wins.
+const _hasUrl = params.get("file_id") || params.get("mode");
+const _ds = IH.loadState("dups") || {};
+if (!_hasUrl) {
+  if (_ds.mode) mode = _ds.mode;
+  if (typeof _ds.page === "number") page = _ds.page;
+  if (_ds.batch) batch = true;
+  if (_ds.fileId) fileId = _ds.fileId;
+  if (_ds.fq != null) $("fq").value = _ds.fq;
+  if (_ds.fsource != null) $("fsource").value = _ds.fsource;
+  if (_ds.fsize != null) $("fsize").value = _ds.fsize;
+  if (_ds.fpossible) $("fpossible").checked = true;
+}
+if (batch) { $("batchToggle").classList.add("active"); $("batchbar").hidden = false; }
+document.querySelectorAll(".tabs button").forEach(b =>
+  b.classList.toggle("active", b.dataset.mode === mode));
+load().then(() => { if (!_hasUrl && _ds.scrollY) window.scrollTo(0, _ds.scrollY); });
 loadTrash();
+window.addEventListener("beforeunload", saveDupState);
 </script>
 </body>
 </html>
@@ -1241,7 +1294,7 @@ async function reveal(id, btn) {
 }
 async function load() {
   const scope = $("scope").value;
-  const d = await (await fetch("/api/duplicates/report?source=" + encodeURIComponent(scope))).json();
+  const d = await IH.cachedFetch("/api/duplicates/report?source=" + encodeURIComponent(scope));
   $("cards").innerHTML = `
     <div class="card"><div class="num">${N(d.files)}</div><div class="lbl">files in scope</div></div>
     <div class="card"><div class="num">${N(d.groups)}</div><div class="lbl">duplicate groups</div></div>
@@ -1272,9 +1325,13 @@ async function load() {
     `&mdash; ${N(d.hashed)} of ${N(d.files)} files hashed. Every removable copy is byte-identical to a kept original.`;
 }
 const sp = new URLSearchParams(location.search);
+const _rs = IH.loadState("report") || {};
 if (sp.get("source")) $("scope").value = sp.get("source");
-$("scope").onchange = load;
-load();
+else if (_rs.scope) $("scope").value = _rs.scope;
+function saveReportState() { IH.saveState("report", {scope: $("scope").value, scrollY: window.scrollY}); }
+$("scope").onchange = () => { saveReportState(); load(); };
+load().then(() => { if (!sp.get("source") && _rs.scrollY) window.scrollTo(0, _rs.scrollY); });
+window.addEventListener("beforeunload", saveReportState);
 </script>
 </body>
 </html>
@@ -1373,9 +1430,55 @@ def footer_html() -> str:
     )
 
 
+# Shared client helper injected into every page's <head> (before page scripts
+# run). Provides sessionStorage-backed API caching and UI-state persistence so
+# switching pages doesn't lose filters/scroll or redundantly re-fetch data.
+COMMON_JS = """
+window.IH = (function () {
+  var CACHE = "ihcache:", STATE = "ihstate:";
+  function cachedFetch(url, ttl) {
+    ttl = ttl || 60000;
+    var key = CACHE + url;
+    try {
+      var raw = sessionStorage.getItem(key);
+      if (raw) {
+        var hit = JSON.parse(raw);
+        if (Date.now() - hit.t < ttl) return Promise.resolve(hit.v);
+      }
+    } catch (e) {}
+    return fetch(url).then(function (r) { return r.json(); }).then(function (v) {
+      try { sessionStorage.setItem(key, JSON.stringify({ t: Date.now(), v: v })); } catch (e) {}
+      return v;
+    });
+  }
+  function bustCache() {
+    try {
+      var del = [];
+      for (var i = 0; i < sessionStorage.length; i++) {
+        var k = sessionStorage.key(i);
+        if (k && k.indexOf(CACHE) === 0) del.push(k);
+      }
+      del.forEach(function (k) { sessionStorage.removeItem(k); });
+    } catch (e) {}
+  }
+  function saveState(key, obj) {
+    try { sessionStorage.setItem(STATE + key, JSON.stringify(obj)); } catch (e) {}
+  }
+  function loadState(key) {
+    try { var r = sessionStorage.getItem(STATE + key); return r ? JSON.parse(r) : null; }
+    catch (e) { return null; }
+  }
+  return { cachedFetch: cachedFetch, bustCache: bustCache,
+           saveState: saveState, loadState: loadState };
+})();
+"""
+
+
 def render_page(html: str) -> bytes:
-    """Inject the shared footer just before </body> and encode for sending."""
-    return html.replace("</body>", footer_html() + "\n</body>", 1).encode()
+    """Inject the shared IH helper into <head> and the footer before </body>."""
+    html = html.replace("</head>", f"<script>{COMMON_JS}</script>\n</head>", 1)
+    html = html.replace("</body>", footer_html() + "\n</body>", 1)
+    return html.encode()
 
 
 def render_app(page_key: str) -> bytes:
