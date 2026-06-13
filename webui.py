@@ -80,12 +80,21 @@ APP_HTML = """<!DOCTYPE html>
   input:focus, select:focus { border-color: var(--accent); }
   .content { display: flex; gap: 16px; align-items: flex-start; }
   .results { flex: 1; min-width: 0; }
-  table { width: 100%; border-collapse: collapse; background: var(--panel);
+  /* Fixed layout makes the table fill its container and lets every cell
+     truncate to a single line with an ellipsis. */
+  table { width: 100%; table-layout: fixed; border-collapse: collapse; background: var(--panel);
           border: 1px solid #262b38; border-radius: 10px; overflow: hidden; }
   th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #232836;
-           white-space: nowrap; }
-  td.path { white-space: normal; word-break: break-all; color: var(--muted);
-            font-family: Consolas, monospace; font-size: 12.5px; }
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  td.path { color: var(--muted); font-family: Consolas, monospace; font-size: 12.5px; }
+  /* Column widths (sum ~100%); Name and Path take the flexible share. */
+  th:nth-child(1), td:nth-child(1) { width: 23%; }
+  th:nth-child(2), td:nth-child(2) { width: 8%; }
+  th:nth-child(3), td:nth-child(3) { width: 9%; }
+  th:nth-child(4), td:nth-child(4) { width: 12%; }
+  th:nth-child(5), td:nth-child(5) { width: 8%; }
+  th:nth-child(6), td:nth-child(6) { width: 10%; }
+  th:nth-child(7), td:nth-child(7) { width: 30%; }
   th { background: var(--panel2); color: var(--muted); font-size: 12px;
        text-transform: uppercase; letter-spacing: .5px; position: sticky; top: 0; }
   tbody tr { cursor: pointer; }
@@ -355,13 +364,13 @@ async function search() {
   lastRows = d.rows;
   $("rows").innerHTML = d.rows.length ? d.rows.map((r, i) => `<tr data-i="${i}"
       class="${sel && sel.id === r.id ? "sel" : ""}${r.marked_delete ? " marked" : ""}">
-      <td>${r.marked_delete ? "&#9888; " : ""}${esc(r.name)}</td>
+      <td title="${esc(r.name)}">${r.marked_delete ? "&#9888; " : ""}${esc(r.name)}</td>
       <td><span class="badge ${r.category || r.kind}">${r.category || r.kind}</span></td>
       <td class="src">${esc(r.source)}</td>
-      <td class="src">${esc(r.device_label || "-")}</td>
+      <td class="src" title="${esc(r.device_label || "-")}">${esc(r.device_label || "-")}</td>
       <td>${fmtSize(r.size)}</td>
       <td class="src">${r.modified ? esc(r.modified.slice(0,10)) : ""}</td>
-      <td class="path">${esc(r.path)}</td>
+      <td class="path" title="${esc(r.path)}">${esc(r.path)}</td>
     </tr>`).join("")
     : `<tr><td colspan="7" class="empty">No matches</td></tr>`;
   const pages = Math.max(1, Math.ceil(total / d.page_size));
