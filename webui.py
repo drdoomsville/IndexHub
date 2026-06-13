@@ -701,6 +701,13 @@ LANDING_HTML = """<!DOCTYPE html>
       <div class="stats" id="dup-stats">Loading&hellip;</div>
       <span class="open">Open &rarr;</span>
     </a>
+    <a class="bigcard" href="/duplicates/report">
+      <div class="icon">&#128202;</div>
+      <h2>Duplicate Report</h2>
+      <div class="desc">Reclaimable space, size breakdown, and the biggest duplicate groups</div>
+      <div class="stats" id="report-stats">Loading&hellip;</div>
+      <span class="open">Open &rarr;</span>
+    </a>
   </div>
   <div class="scan-panel">
     <h2>Rescan / Reindex</h2>
@@ -749,6 +756,13 @@ fetch("/api/duplicates/summary").then(r => r.json()).then(s => {
     `</span>`;
 }).catch(() => {
   document.getElementById("dup-stats").textContent = "Open to scan for duplicates";
+});
+fetch("/api/duplicates/report").then(r => r.json()).then(d => {
+  document.getElementById("report-stats").innerHTML =
+    `<b>${fmtSize(d.reclaim)}</b> reclaimable · ` +
+    `<span style="font-size:12.5px">${d.redundant.toLocaleString()} removable copies in ${d.groups.toLocaleString()} groups</span>`;
+}).catch(() => {
+  document.getElementById("report-stats").textContent = "Open to view the report";
 });
 let scanPoll;
 async function refreshScanStatus() {
@@ -847,7 +861,7 @@ DUPS_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="wrap">
-  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/media">Media</a> &middot; <a href="/documents">Documents</a></div>
+  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/duplicates/report">Report</a> &middot; <a href="/media">Media</a> &middot; <a href="/documents">Documents</a></div>
   <h1>Duplicate <span>Checker</span></h1>
   <div class="sub" id="sub">Cross-drive duplicate detection by filename, metadata fingerprint, and content hash.</div>
   <div class="tabs">
@@ -957,6 +971,138 @@ document.querySelectorAll(".tabs button").forEach(btn => {
 $("prev").onclick = () => { page--; load(); };
 $("next").onclick = () => { page++; load(); };
 if (params.get("mode")) mode = params.get("mode");
+load();
+</script>
+</body>
+</html>
+"""
+
+DUP_REPORT_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duplicate Report</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --panel2:#1f2330; --text:#e6e9f0; --muted:#8b93a7; --accent:#5b8cff; --good:#46c08a; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--text); font:14px/1.5 "Segoe UI", system-ui, sans-serif; }
+  .wrap { max-width:1100px; margin:0 auto; padding:24px 20px 60px; }
+  h1 { font-size:22px; font-weight:600; }
+  h1 span { color:var(--accent); }
+  h2 { font-size:15px; font-weight:600; margin:26px 0 10px; color:var(--text); }
+  .sub { color:var(--muted); margin:4px 0 18px; font-size:13px; }
+  .topnav { margin-bottom:12px; }
+  .topnav a { color:var(--muted); text-decoration:none; font-size:13px; margin-right:8px; }
+  .topnav a:hover { color:var(--accent); }
+  .controls { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  select { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px; padding:7px 10px; font-size:13px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:6px; }
+  .card { background:var(--panel); border:1px solid #262b38; border-radius:12px; padding:14px 16px; }
+  .card .num { font-size:24px; font-weight:700; }
+  .card .num.hl { color:var(--good); }
+  .card .lbl { color:var(--muted); font-size:12px; margin-top:2px; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid #262b38; border-radius:10px; overflow:hidden; }
+  th, td { text-align:left; padding:9px 12px; border-top:1px solid #232836; font-size:13px; }
+  th { color:var(--muted); font-size:11px; text-transform:uppercase; border-top:none; background:var(--panel2); }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  td.path { color:var(--muted); font-family:Consolas,monospace; font-size:12px; word-break:break-all; }
+  tr.clickable:hover { background:#1c2433; cursor:pointer; }
+  .bar { height:7px; background:var(--panel2); border-radius:4px; overflow:hidden; margin-top:4px; }
+  .bar > i { display:block; height:100%; background:var(--accent); }
+  .reveal-btn { background:var(--panel2); border:1px solid #2c3344; border-radius:7px; padding:4px 9px; font-size:12px; cursor:pointer; white-space:nowrap; color:var(--text); }
+  .reveal-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .src { display:inline-block; font-size:11px; color:var(--muted); }
+  a.glink { color:var(--accent); text-decoration:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/duplicates">Duplicate checker</a> &middot; <a href="/media">Media</a> &middot; <a href="/documents">Documents</a></div>
+  <h1>Duplicate <span>Report</span></h1>
+  <div class="sub" id="sub">Exact content-hash duplicates &mdash; every removable copy is byte-identical to a kept original.</div>
+  <div class="controls">
+    <label class="src">Scope:</label>
+    <select id="scope">
+      <option value="">All sources</option>
+      <option value="local">Local</option>
+      <option value="onedrive">OneDrive</option>
+      <option value="gdrive">Google Drive</option>
+      <option value="qnap">QNAP NAS</option>
+    </select>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <h2>Reclaimable space by file size</h2>
+  <table id="buckets"><thead><tr>
+    <th>Per-file size</th><th class="num">Groups</th><th class="num">Removable copies</th>
+    <th class="num">Reclaimable</th><th style="width:30%">Share</th>
+  </tr></thead><tbody></tbody></table>
+
+  <h2>By source</h2>
+  <table id="persource"><thead><tr>
+    <th>Source</th><th class="num">Hashed files</th><th class="num">Dup groups</th>
+    <th class="num">Removable copies</th><th class="num">Reclaimable</th>
+  </tr></thead><tbody></tbody></table>
+
+  <h2>Biggest duplicate groups</h2>
+  <table id="top"><thead><tr>
+    <th>File</th><th class="num">Copies</th><th class="num">Each</th>
+    <th class="num">Reclaimable</th><th></th>
+  </tr></thead><tbody></tbody></table>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function fmtSize(n) {
+  if (n == null || n < 0) return "";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toLocaleString(undefined, {maximumFractionDigits: 1}) + " " + u[i];
+}
+const N = n => (n || 0).toLocaleString();
+async function reveal(id, btn) {
+  const orig = btn.textContent; btn.textContent = "Opening…"; btn.disabled = true;
+  const res = await (await fetch("/api/reveal", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})})).json();
+  if (!res.ok) alert(res.error || "Open folder failed");
+  btn.textContent = orig; btn.disabled = false;
+}
+async function load() {
+  const scope = $("scope").value;
+  const d = await (await fetch("/api/duplicates/report?source=" + encodeURIComponent(scope))).json();
+  $("cards").innerHTML = `
+    <div class="card"><div class="num">${N(d.files)}</div><div class="lbl">files in scope</div></div>
+    <div class="card"><div class="num">${N(d.groups)}</div><div class="lbl">duplicate groups</div></div>
+    <div class="card"><div class="num">${N(d.redundant)}</div><div class="lbl">removable copies</div></div>
+    <div class="card"><div class="num hl">${fmtSize(d.reclaim)}</div><div class="lbl">reclaimable space</div></div>
+    <div class="card"><div class="num">${fmtSize(d.ibytes)}</div><div class="lbl">indexed in scope</div></div>`;
+  const maxB = Math.max(1, ...d.buckets.map(b => b.bytes));
+  $("buckets").querySelector("tbody").innerHTML = d.buckets.map(b => `
+    <tr><td>${esc(b.label)}</td><td class="num">${N(b.groups)}</td><td class="num">${N(b.copies)}</td>
+    <td class="num">${fmtSize(b.bytes)}</td>
+    <td><div class="bar"><i style="width:${(100*b.bytes/maxB).toFixed(1)}%"></i></div></td></tr>`).join("");
+  const SRCLABEL = {local:"Local", onedrive:"OneDrive", gdrive:"Google Drive", qnap:"QNAP NAS"};
+  $("persource").querySelector("tbody").innerHTML = d.per_source.map(s => `
+    <tr class="clickable" onclick="$('scope').value='${s.source}';load()">
+      <td>${esc(SRCLABEL[s.source] || s.source)}</td><td class="num">${N(s.files)}</td>
+      <td class="num">${N(s.groups)}</td><td class="num">${N(s.copies)}</td>
+      <td class="num">${fmtSize(s.reclaim)}</td></tr>`).join("")
+      || `<tr><td colspan="5" style="color:var(--muted)">No duplicates.</td></tr>`;
+  $("top").querySelector("tbody").innerHTML = d.top.map(t => `
+    <tr>
+      <td><a class="glink" href="/duplicates?mode=hash&file_id=${t.id}" title="Show this group in the duplicate checker">${esc(t.name)}</a>
+        <div class="path">${esc(t.path)} <span class="src">&middot; ${esc(t.source)}</span></div></td>
+      <td class="num">${t.count}×</td><td class="num">${fmtSize(t.each)}</td>
+      <td class="num">${fmtSize(t.waste)}</td>
+      <td><button class="reveal-btn" onclick="reveal(${t.id}, this)" title="Open containing folder in Explorer">&#128193; Open</button></td>
+    </tr>`).join("") || `<tr><td colspan="5" style="color:var(--muted)">No duplicate groups.</td></tr>`;
+  $("sub").innerHTML = `Exact content-hash duplicates in <b>${d.scope === "all" ? "all sources" : esc(SRCLABEL[d.scope] || d.scope)}</b> ` +
+    `&mdash; ${N(d.hashed)} of ${N(d.files)} files hashed. Every removable copy is byte-identical to a kept original.`;
+}
+const sp = new URLSearchParams(location.search);
+if (sp.get("source")) $("scope").value = sp.get("source");
+$("scope").onchange = load;
 load();
 </script>
 </body>
@@ -1293,6 +1439,94 @@ def api_duplicates_summary():
     return {"total": total, "hashed": hashed, "groups": groups, "possible": possible}
 
 
+REPORT_BUCKETS = [
+    ("≥ 1 GB", 1_000_000_000, None),
+    ("100 MB – 1 GB", 100_000_000, 1_000_000_000),
+    ("10 – 100 MB", 10_000_000, 100_000_000),
+    ("< 10 MB", 0, 10_000_000),
+]
+
+
+def api_duplicates_report(params):
+    """Exact-content-hash duplicate breakdown, optionally scoped to one source.
+    Reports group/redundant-copy counts, reclaimable bytes, size buckets, a
+    per-source rollup, and the biggest groups by reclaimable space."""
+    source = params.get("source", [""])[0]
+    if source not in ("local", "onedrive", "gdrive", "qnap"):
+        source = ""
+    conn = db()
+    hashed_clause = "content_hash IS NOT NULL AND content_hash != ''"
+    scope_clause = hashed_clause + (" AND source = ?" if source else "")
+    scope_args = [source] if source else []
+
+    files, ibytes = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(size),0) FROM files WHERE "
+        + (("source = ?") if source else "1=1"), scope_args).fetchone()
+    hashed = conn.execute(
+        f"SELECT COUNT(*) FROM files WHERE {scope_clause}", scope_args).fetchone()[0]
+
+    # Duplicate groups within scope (cross-source when no source is selected).
+    rows = conn.execute(
+        f"SELECT content_hash h, COUNT(*) c, MAX(size) sz FROM files "
+        f"WHERE {scope_clause} GROUP BY content_hash HAVING c > 1", scope_args).fetchall()
+
+    groups = len(rows)
+    redundant = sum(r["c"] - 1 for r in rows)
+    reclaim = sum((r["c"] - 1) * (r["sz"] or 0) for r in rows)
+
+    buckets = []
+    for label, lo, hi in REPORT_BUCKETS:
+        sel = [r for r in rows
+               if (r["sz"] or 0) >= lo and (hi is None or (r["sz"] or 0) < hi)]
+        buckets.append({
+            "label": label,
+            "groups": len(sel),
+            "copies": sum(r["c"] - 1 for r in sel),
+            "bytes": sum((r["c"] - 1) * (r["sz"] or 0) for r in sel),
+        })
+
+    top = sorted(rows, key=lambda r: (r["c"] - 1) * (r["sz"] or 0), reverse=True)[:25]
+    top_out = []
+    for r in top:
+        sample = conn.execute(
+            "SELECT id, name, path, source FROM files WHERE content_hash = ?"
+            + (" AND source = ?" if source else "") + " ORDER BY source, path LIMIT 1",
+            [r["h"]] + scope_args).fetchone()
+        if not sample:
+            continue
+        top_out.append({
+            "id": sample["id"], "name": sample["name"], "path": sample["path"],
+            "source": sample["source"], "count": r["c"], "each": r["sz"] or 0,
+            "waste": (r["c"] - 1) * (r["sz"] or 0),
+        })
+
+    # Per-source rollup: duplicate groups *within* each source.
+    per_rows = conn.execute(
+        f"SELECT source, content_hash, COUNT(*) c, MAX(size) sz FROM files "
+        f"WHERE {hashed_clause} GROUP BY source, content_hash HAVING c > 1").fetchall()
+    roll = {}
+    for r in per_rows:
+        d = roll.setdefault(r["source"], {"groups": 0, "copies": 0, "reclaim": 0})
+        d["groups"] += 1
+        d["copies"] += r["c"] - 1
+        d["reclaim"] += (r["c"] - 1) * (r["sz"] or 0)
+    counts = dict(conn.execute(
+        f"SELECT source, COUNT(*) FROM files WHERE {hashed_clause} GROUP BY source"))
+    per_source = []
+    for src in ("local", "onedrive", "gdrive", "qnap"):
+        if src not in counts and src not in roll:
+            continue
+        d = roll.get(src, {"groups": 0, "copies": 0, "reclaim": 0})
+        per_source.append({"source": src, "files": counts.get(src, 0), **d})
+
+    conn.close()
+    return {
+        "scope": source or "all", "files": files, "ibytes": ibytes, "hashed": hashed,
+        "groups": groups, "redundant": redundant, "reclaim": reclaim,
+        "buckets": buckets, "top": top_out, "per_source": per_source,
+    }
+
+
 def _dup_filters(params):
     """Build extra WHERE conditions for the duplicate-group queries from the
     filter params. Returns (sql_fragment, args); the fragment begins with
@@ -1547,6 +1781,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, render_app(url.path[1:]), "text/html; charset=utf-8")
         elif url.path == "/duplicates":
             self._send(200, DUPS_HTML.encode(), "text/html; charset=utf-8")
+        elif url.path == "/duplicates/report":
+            self._send(200, DUP_REPORT_HTML.encode(), "text/html; charset=utf-8")
+        elif url.path == "/api/duplicates/report":
+            self._json(api_duplicates_report(parse_qs(url.query)))
         elif url.path == "/api/stats":
             self._json(api_stats(parse_qs(url.query)))
         elif url.path == "/api/search":
