@@ -1509,9 +1509,16 @@ def api_reveal(body):
     if not target:
         label = "Google Drive" if row["source"] == "gdrive" else row["source"]
         return {"ok": False, "error": f"Open folder is not available for {label} files"}
-    # explorer.exe returns a non-zero exit code even on success, so fire and
-    # forget. /select, highlights the file inside its folder.
-    subprocess.Popen(["explorer", f"/select,{target}"])
+    target = os.path.normpath(target)
+    if not os.path.exists(target):
+        return {"ok": False, "error": f"Not found on this machine: {target}"}
+    # explorer.exe does its own command-line parsing: the path must be quoted
+    # *inside* the /select, switch, because filenames often contain spaces or
+    # parentheses. Passing a list would quote the whole "/select,<path>" token,
+    # which Explorer ignores — it then opens the default folder instead of
+    # selecting the file. Use a raw command string so the quotes land around
+    # only the path. Explorer returns non-zero even on success, so fire/forget.
+    subprocess.Popen(f'explorer /select,"{target}"')
     return {"ok": True, "path": target}
 
 
