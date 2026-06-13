@@ -877,6 +877,14 @@ DUPS_HTML = """<!DOCTYPE html>
   .trash-item .nm { color:var(--text); }
   .trash-item .meta { color:var(--muted); font-family:Consolas,monospace; font-size:11px; word-break:break-all; flex:1; }
   body.has-trash .wrap { padding-bottom:36vh; }
+  .batch-toggle.active { border-color:var(--accent); color:var(--accent); }
+  .batchbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:14px;
+    background:var(--panel); border:1px solid #2c3344; border-radius:10px; padding:10px 12px; }
+  .batchbar select { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px; padding:7px 10px; font-size:13px; }
+  .selinfo { color:var(--muted); font-size:13px; margin-left:auto; }
+  .selinfo b { color:var(--text); }
+  td.cb, th.cb { width:34px; text-align:center; }
+  td.cb input { width:16px; height:16px; cursor:pointer; }
 </style>
 </head>
 <body>
@@ -906,7 +914,21 @@ DUPS_HTML = """<!DOCTYPE html>
       <option value="1000000000">&ge; 1 GB</option>
     </select>
     <label><input type="checkbox" id="fpossible"> Large files for review only</label>
+    <button id="batchToggle" class="batch-toggle" type="button">&#9745; Batch select</button>
     <button id="freset" type="button">Reset</button>
+  </div>
+  <div class="batchbar" id="batchbar" hidden>
+    <select id="keepRule" title="Which copy to keep in each group">
+      <option value="shallow">Keep shallowest path</option>
+      <option value="deep">Keep deepest path</option>
+      <option value="alpha">Keep first path (A&rarr;Z)</option>
+      <option value="newest">Keep newest</option>
+      <option value="oldest">Keep oldest</option>
+    </select>
+    <button id="autoSel" type="button">Auto-select duplicates</button>
+    <button id="clearSel" type="button">Clear</button>
+    <span class="selinfo" id="selInfo"><b>0</b> selected</span>
+    <button id="delSel" class="del-btn" type="button" disabled>Delete selected</button>
   </div>
   <div id="anchor" hidden></div>
   <div id="groups"></div>
@@ -925,6 +947,7 @@ const $ = id => document.getElementById(id);
 const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const params = new URLSearchParams(location.search);
 let mode = "name", page = 0, fileId = params.get("file_id") || "";
+let batch = false, lastGroups = [];
 function fmtSize(n) {
   if (n == null || n < 0) return "";
   const u = ["B","KB","MB","GB","TB"]; let i = 0;
@@ -948,11 +971,13 @@ async function load() {
   } else {
     $("anchor").hidden = true;
   }
+  lastGroups = d.groups;
   $("groups").innerHTML = d.groups.length ? d.groups.map(g => `
     <div class="group">
       <div class="group-h"><b>${g.count} files</b> \u00b7 ${esc(g.label)}</div>
-      <table><thead><tr><th>Name</th><th>Source</th><th>Size</th><th>Modified</th><th>Path</th><th></th></tr></thead>
+      <table><thead><tr>${batch ? '<th class="cb"></th>' : ""}<th>Name</th><th>Source</th><th>Size</th><th>Modified</th><th>Path</th><th></th></tr></thead>
       <tbody>${g.files.map(f => `<tr data-row="${f.id}">
+        ${batch ? `<td class="cb"><input type="checkbox" class="rowcb" data-id="${f.id}" data-group="${esc(String(g.key))}" data-size="${f.size || 0}"></td>` : ""}
         <td>${esc(f.name)}${f.possible_dupe ? ' <span class="flag">&ge;1 GB &middot; not hashed</span>' : ""}</td><td>${esc(f.source)}</td><td>${fmtSize(f.size)}</td>
         <td>${f.modified ? esc(f.modified.slice(0,10)) : ""}</td>
         <td class="path">${esc(f.path)}</td>
@@ -966,7 +991,74 @@ async function load() {
   $("pageinfo").textContent = `${d.total_groups.toLocaleString()} group(s) \u00b7 page ${page + 1} of ${pages}`;
   $("prev").disabled = page === 0;
   $("next").disabled = page >= pages - 1;
+  updateSelInfo();
 }
+// ---- batch selection ----
+function pathDepth(p) { return (p.match(/[\\\\/]/g) || []).length; }
+function keeperId(files, rule) {
+  const a = files.slice();
+  if (rule === "shallow") a.sort((x, y) => pathDepth(x.path) - pathDepth(y.path) || x.path.length - y.path.length || x.path.localeCompare(y.path));
+  else if (rule === "deep") a.sort((x, y) => pathDepth(y.path) - pathDepth(x.path) || y.path.length - x.path.length || x.path.localeCompare(y.path));
+  else if (rule === "alpha") a.sort((x, y) => x.path.localeCompare(y.path));
+  else if (rule === "newest") a.sort((x, y) => (y.modified || "").localeCompare(x.modified || ""));
+  else if (rule === "oldest") a.sort((x, y) => (x.modified || "").localeCompare(y.modified || ""));
+  return a[0].id;
+}
+function autoSelect() {
+  const rule = $("keepRule").value;
+  const keepers = new Set();
+  lastGroups.forEach(g => keepers.add(String(g.key) + "|" + keeperId(g.files, rule)));
+  document.querySelectorAll(".rowcb").forEach(cb => {
+    cb.checked = !keepers.has(cb.dataset.group + "|" + cb.dataset.id);
+  });
+  updateSelInfo();
+}
+function updateSelInfo() {
+  if (!batch) return;
+  const checked = [...document.querySelectorAll(".rowcb:checked")];
+  const bytes = checked.reduce((s, cb) => s + (+cb.dataset.size || 0), 0);
+  $("selInfo").innerHTML = `<b>${checked.length}</b> selected \u00b7 ${fmtSize(bytes)}`;
+  $("delSel").disabled = checked.length === 0;
+}
+async function deleteSelected() {
+  const checked = [...document.querySelectorAll(".rowcb:checked")];
+  if (!checked.length) return;
+  // Guard: never delete every visible copy in a group.
+  const tally = {};
+  document.querySelectorAll(".rowcb").forEach(cb => { (tally[cb.dataset.group] ||= {total: 0, sel: 0}).total++; });
+  checked.forEach(cb => { tally[cb.dataset.group].sel++; });
+  const bad = Object.values(tally).filter(g => g.sel >= g.total).length;
+  if (bad) { alert(`${bad} group(s) would have every shown copy deleted.\nLeave at least one copy per group.`); return; }
+  const ids = checked.map(cb => +cb.dataset.id);
+  if (!confirm(`Delete ${ids.length} file(s) to session trash?\nThey can be restored until you close the browser.`)) return;
+  $("delSel").disabled = true; $("delSel").textContent = "Deleting\u2026";
+  const res = await (await fetch("/api/delete-batch", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ids}),
+  })).json();
+  $("delSel").textContent = "Delete selected";
+  if (res.ok) {
+    if (res.failed && res.failed.length)
+      alert(`Deleted ${res.deleted} of ${res.requested}. ${res.failed.length} failed:\n` +
+            res.failed.slice(0, 6).map(f => "\u2022 " + f.error).join("\n"));
+    loadTrash(); load();
+  } else { alert(res.error || "Batch delete failed"); $("delSel").disabled = false; }
+}
+$("batchToggle").onclick = () => {
+  batch = !batch;
+  $("batchToggle").classList.toggle("active", batch);
+  $("batchbar").hidden = !batch;
+  load();
+};
+$("autoSel").onclick = autoSelect;
+$("clearSel").onclick = () => {
+  document.querySelectorAll(".rowcb").forEach(cb => cb.checked = false);
+  updateSelInfo();
+};
+$("delSel").onclick = deleteSelected;
+$("groups").addEventListener("change", e => {
+  if (e.target.classList.contains("rowcb")) updateSelInfo();
+});
 $("groups").addEventListener("click", async e => {
   const rev = e.target.closest("[data-reveal]");
   if (rev) {
@@ -1781,6 +1873,29 @@ def api_delete_file(body, session_id: str):
         conn.close()
 
 
+def api_delete_batch(body, session_id: str):
+    """Delete many files to session trash in one call. Each file is handled
+    independently; a failure on one doesn't abort the rest."""
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not ids:
+        return {"ok": False, "error": "No files selected"}
+    if len(ids) > 5000:
+        return {"ok": False, "error": "Too many files in one batch (max 5000)"}
+    conn = db()
+    deleted, failed = [], []
+    try:
+        for fid in ids:
+            try:
+                res = file_ops.file_sessions.delete_file(conn, session_id, str(fid))
+                deleted.append(res["entry"]["entry_id"])
+            except Exception as exc:
+                failed.append({"id": fid, "error": str(exc)})
+    finally:
+        conn.close()
+    return {"ok": True, "deleted": len(deleted), "failed": failed,
+            "requested": len(ids)}
+
+
 def api_restore_file(body, session_id: str):
     conn = db()
     try:
@@ -1896,6 +2011,12 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/delete":
             try:
                 self._json(api_delete_file(body, self.session_id))
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/delete-batch":
+            try:
+                self._json(api_delete_batch(body, self.session_id))
             except ValueError as exc:
                 self._json({"ok": False, "error": str(exc)})
             return
