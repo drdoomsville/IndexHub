@@ -616,6 +616,11 @@ $("next").onclick = () => { page++; search(); };
 setOptions($("kind"), KIND_OPTS.map(([v, l]) => ({value: v, label: l, count: null})));
 setOptions($("source"), SOURCE_OPTS.map(([v, l]) => ({value: v, label: l, count: null})));
 setOptions($("machine"), [{value: "", label: "All machines", count: null}]);
+// Deep-link support: /media?q=...&source=... (used by the duplicate checker's
+// "Library" jump) pre-fills the filters so you land on the file.
+const _initP = new URLSearchParams(location.search);
+if (_initP.get("q")) $("q").value = _initP.get("q");
+if (_initP.get("source")) $("source").value = _initP.get("source");
 loadStats();
 updateFacets();
 search();
@@ -854,9 +859,24 @@ DUPS_HTML = """<!DOCTYPE html>
     border:1px solid #2c3344; border-radius:8px; padding:7px 10px; font-size:13px; }
   .filters input[type=text] { min-width:220px; flex:1 1 220px; }
   .filters label { color:var(--muted); font-size:13px; display:flex; align-items:center; gap:6px; }
-  .reveal-btn { background:var(--panel2); border:1px solid #2c3344; border-radius:7px;
+  .reveal-btn { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:7px;
     padding:4px 10px; font-size:12px; cursor:pointer; white-space:nowrap; }
   .reveal-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .reveal-btn:disabled { opacity:.5; cursor:default; }
+  .del-btn { background:#3a2330; color:#f0859e; border:1px solid #5a3344; border-radius:7px;
+    padding:4px 10px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  .del-btn:hover { border-color:#e0506e; color:#ff7090; }
+  .del-btn:disabled { opacity:.5; cursor:default; }
+  .lib-link { color:var(--accent); text-decoration:none; font-size:12px; white-space:nowrap; padding:4px 4px; }
+  .lib-link:hover { text-decoration:underline; }
+  .acts { display:flex; gap:6px; justify-content:flex-end; align-items:center; flex-wrap:wrap; }
+  .trash-bar { position:fixed; bottom:0; left:0; right:0; background:#1a1d26; border-top:1px solid #2c3344;
+    padding:10px 18px; max-height:32vh; overflow:auto; box-shadow:0 -4px 14px rgba(0,0,0,.4); }
+  .trash-bar h3 { font-size:13px; color:#46c08a; margin-bottom:6px; font-weight:600; }
+  .trash-item { display:flex; gap:10px; align-items:center; font-size:12.5px; padding:3px 0; }
+  .trash-item .nm { color:var(--text); }
+  .trash-item .meta { color:var(--muted); font-family:Consolas,monospace; font-size:11px; word-break:break-all; flex:1; }
+  body.has-trash .wrap { padding-bottom:36vh; }
 </style>
 </head>
 <body>
@@ -896,6 +916,10 @@ DUPS_HTML = """<!DOCTYPE html>
     <button id="next">Next &rarr;</button>
   </div>
 </div>
+<div class="trash-bar" id="trashBar" hidden>
+  <h3>Session trash &mdash; restore before closing the browser</h3>
+  <div id="trashList"></div>
+</div>
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -928,11 +952,15 @@ async function load() {
     <div class="group">
       <div class="group-h"><b>${g.count} files</b> \u00b7 ${esc(g.label)}</div>
       <table><thead><tr><th>Name</th><th>Source</th><th>Size</th><th>Modified</th><th>Path</th><th></th></tr></thead>
-      <tbody>${g.files.map(f => `<tr>
+      <tbody>${g.files.map(f => `<tr data-row="${f.id}">
         <td>${esc(f.name)}${f.possible_dupe ? ' <span class="flag">&ge;1 GB &middot; not hashed</span>' : ""}</td><td>${esc(f.source)}</td><td>${fmtSize(f.size)}</td>
         <td>${f.modified ? esc(f.modified.slice(0,10)) : ""}</td>
         <td class="path">${esc(f.path)}</td>
-        <td><button class="reveal-btn" data-reveal="${f.id}" title="Open containing folder in Explorer">&#128193; Open folder</button></td></tr>`).join("")}</tbody></table>
+        <td class="acts">
+          <a class="lib-link" href="/${f.kind === "document" ? "documents" : "media"}?q=${encodeURIComponent(f.name)}&source=${encodeURIComponent(f.source)}" target="_blank" title="Open in the library with rename / move / delete">Library &#8599;</a>
+          <button class="reveal-btn" data-reveal="${f.id}" title="Open containing folder in Explorer">&#128193;</button>
+          <button class="del-btn" data-del="${f.id}" data-name="${esc(f.name)}" title="Delete to session trash (restorable)">Delete</button>
+        </td></tr>`).join("")}</tbody></table>
     </div>`).join("") : `<div class="empty">No duplicate groups found for this filter.</div>`;
   const pages = Math.max(1, Math.ceil(d.total_groups / d.page_size));
   $("pageinfo").textContent = `${d.total_groups.toLocaleString()} group(s) \u00b7 page ${page + 1} of ${pages}`;
@@ -940,16 +968,52 @@ async function load() {
   $("next").disabled = page >= pages - 1;
 }
 $("groups").addEventListener("click", async e => {
-  const btn = e.target.closest("[data-reveal]");
-  if (!btn) return;
-  const orig = btn.textContent;
-  btn.textContent = "Opening\u2026"; btn.disabled = true;
-  const res = await (await fetch("/api/reveal", {
+  const rev = e.target.closest("[data-reveal]");
+  if (rev) {
+    const orig = rev.textContent;
+    rev.textContent = "\u2026"; rev.disabled = true;
+    const res = await (await fetch("/api/reveal", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id: +rev.dataset.reveal}),
+    })).json();
+    if (!res.ok) alert(res.error || "Open folder failed");
+    rev.textContent = orig; rev.disabled = false;
+    return;
+  }
+  const del = e.target.closest("[data-del]");
+  if (del) {
+    if (!confirm(`Delete "${del.dataset.name}"?\n\nIt moves to session trash and can be restored until you close the browser.`)) return;
+    del.disabled = true; del.textContent = "Deleting\u2026";
+    const res = await (await fetch("/api/delete", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id: +del.dataset.del}),
+    })).json();
+    if (res.ok) { loadTrash(); load(); }
+    else { alert(res.error || "Delete failed"); del.disabled = false; del.textContent = "Delete"; }
+  }
+});
+async function loadTrash() {
+  const d = await (await fetch("/api/trash")).json();
+  const bar = $("trashBar"), list = $("trashList");
+  if (!d.items.length) { bar.hidden = true; document.body.classList.remove("has-trash"); return; }
+  bar.hidden = false; document.body.classList.add("has-trash");
+  list.innerHTML = d.items.map(it => `
+    <div class="trash-item">
+      <span class="nm">${esc(it.name)}</span>
+      <span class="meta">${esc(it.source)} \u00b7 ${esc(it.original_path)}</span>
+      <button class="reveal-btn" data-restore="${esc(it.entry_id)}">Restore</button>
+    </div>`).join("");
+}
+$("trashList").addEventListener("click", async e => {
+  const b = e.target.closest("[data-restore]");
+  if (!b) return;
+  b.disabled = true;
+  const res = await (await fetch("/api/restore", {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({id: +btn.dataset.reveal}),
+    body: JSON.stringify({entry_id: b.dataset.restore}),
   })).json();
-  if (!res.ok) alert(res.error || "Open folder failed");
-  btn.textContent = orig; btn.disabled = false;
+  if (res.ok) { loadTrash(); load(); }
+  else { alert(res.error || "Restore failed"); b.disabled = false; }
 });
 let ft;
 $("fq").addEventListener("input", () => { clearTimeout(ft); ft = setTimeout(() => { page = 0; load(); }, 300); });
@@ -972,6 +1036,7 @@ $("prev").onclick = () => { page--; load(); };
 $("next").onclick = () => { page++; load(); };
 if (params.get("mode")) mode = params.get("mode");
 load();
+loadTrash();
 </script>
 </body>
 </html>
@@ -1417,7 +1482,7 @@ def _file_brief(row) -> dict:
         "id": row["id"], "source": row["source"], "name": row["name"],
         "path": row["path"], "size": row["size"], "modified": row["modified"],
         "content_hash": row["content_hash"], "meta_fingerprint": row["meta_fingerprint"],
-        "possible_dupe": row["possible_dupe"],
+        "possible_dupe": row["possible_dupe"], "kind": row["kind"],
     }
 
 
