@@ -27,6 +27,10 @@ DB_PATH = Path(__file__).parent / "media_index.db"
 PAGE_SIZE = 100
 CHUNK = 256 * 1024
 
+# Set from CLI args in main(); the footer reads these to advertise the LAN URL.
+BIND_HOST = "127.0.0.1"
+BIND_PORT = 8765
+
 SORT_COLUMNS = {
     "name": "name COLLATE NOCASE ASC",
     "size": "size DESC",
@@ -1300,11 +1304,85 @@ PAGES = {
 }
 
 
+def _ip_rank(ip: str) -> int:
+    """Score an IPv4 as a LAN-URL candidate. Higher is better; <0 excludes it.
+
+    Prefers ordinary home/office private ranges and rejects loopback,
+    link-local, and CGNAT (100.64/10, which is what Tailscale hands out).
+    """
+    octets = ip.split(".")
+    if len(octets) != 4 or not all(o.isdigit() for o in octets):
+        return -1
+    a, b = int(octets[0]), int(octets[1])
+    if a == 127 or (a == 169 and b == 254):       # loopback / link-local
+        return -1
+    if a == 100 and 64 <= b <= 127:               # CGNAT (Tailscale, carrier NAT)
+        return -1
+    if a == 192 and b == 168:                     # 192.168.0.0/16
+        return 3
+    if a == 10:                                   # 10.0.0.0/8
+        return 2
+    if a == 172 and 16 <= b <= 31:                # 172.16.0.0/12 (incl. Hyper-V)
+        return 1
+    return 0
+
+
+def lan_ip() -> str | None:
+    """Best-guess primary LAN IPv4.
+
+    Gathers every bound IPv4 plus the outbound-route interface, then prefers
+    real private ranges (192.168 > 10 > 172.16/12) so we don't advertise a
+    Tailscale/CGNAT address or a virtual adapter as the LAN URL.
+    """
+    candidates = set()
+    try:
+        for ai in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            candidates.add(ai[4][0])
+    except OSError:
+        pass
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))   # no packets sent; just resolves the route
+        candidates.add(s.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        s.close()
+    ranked = sorted(((_ip_rank(ip), ip) for ip in candidates), reverse=True)
+    for score, ip in ranked:
+        if score >= 0:
+            return ip
+    return None
+
+
+def footer_html() -> str:
+    """Footer shown on every page; advertises the LAN URL when bound wide."""
+    link = "color:#5b8cff;text-decoration:none"
+    local = f"http://localhost:{BIND_PORT}"
+    parts = [f'<a style="{link}" href="{local}">{local}</a>']
+    if BIND_HOST not in ("127.0.0.1", "localhost"):
+        ip = BIND_HOST if BIND_HOST != "0.0.0.0" else lan_ip()
+        if ip:
+            lan = f"http://{ip}:{BIND_PORT}"
+            parts.append(f'LAN: <a style="{link}" href="{lan}">{lan}</a>')
+    return (
+        '<footer style="max-width:1500px;margin:32px auto 0;padding:16px 20px;'
+        "border-top:1px solid #262b38;color:#8b93a7;font-size:12.5px;"
+        'text-align:center">File <span style="color:#5b8cff">Index</span> Hub'
+        " &middot; " + " &middot; ".join(parts) + "</footer>"
+    )
+
+
+def render_page(html: str) -> bytes:
+    """Inject the shared footer just before </body> and encode for sending."""
+    return html.replace("</body>", footer_html() + "\n</body>", 1).encode()
+
+
 def render_app(page_key: str) -> bytes:
     cfg = PAGES[page_key]
     html = APP_HTML.replace("__TITLE__", cfg["title"])
     html = html.replace("__CONFIG__", json.dumps(cfg))
-    return html.encode()
+    return render_page(html)
 
 
 def db():
@@ -1991,13 +2069,13 @@ class Handler(BaseHTTPRequestHandler):
         self._ensure_session()
         url = urlparse(self.path)
         if url.path == "/":
-            self._send(200, LANDING_HTML.encode(), "text/html; charset=utf-8")
+            self._send(200, render_page(LANDING_HTML), "text/html; charset=utf-8")
         elif url.path in ("/media", "/documents"):
             self._send(200, render_app(url.path[1:]), "text/html; charset=utf-8")
         elif url.path == "/duplicates":
-            self._send(200, DUPS_HTML.encode(), "text/html; charset=utf-8")
+            self._send(200, render_page(DUPS_HTML), "text/html; charset=utf-8")
         elif url.path == "/duplicates/report":
-            self._send(200, DUP_REPORT_HTML.encode(), "text/html; charset=utf-8")
+            self._send(200, render_page(DUP_REPORT_HTML), "text/html; charset=utf-8")
         elif url.path == "/api/duplicates/report":
             self._json(api_duplicates_report(parse_qs(url.query)))
         elif url.path == "/api/stats":
@@ -2200,10 +2278,12 @@ def main():
                         help="bind address; use 0.0.0.0 to let other machines "
                         "on your network reach this server")
     args = parser.parse_args()
+    global BIND_HOST, BIND_PORT
+    BIND_HOST, BIND_PORT = args.host, args.port
     server = Server((args.host, args.port), Handler)
     print(f"Media Index UI running at http://localhost:{args.port}  (Ctrl+C to stop)")
     if args.host == "0.0.0.0":
-        ip = socket.gethostbyname(socket.gethostname())
+        ip = lan_ip() or socket.gethostbyname(socket.gethostname())
         print(f"  Reachable from other machines on your LAN at http://{ip}:{args.port}")
         if not os.environ.get("INDEXHUB_TOKEN"):
             print("  NOTE: no INDEXHUB_TOKEN set — any machine on your LAN can push "
