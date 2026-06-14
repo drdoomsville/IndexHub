@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -13,6 +14,32 @@ from pathlib import Path, PurePosixPath
 import media_index as mi
 
 TRASH_ROOT = Path(__file__).parent / ".trash"
+
+
+def long_path(path: str) -> str:
+    """Windows extended-length form (\\\\?\\...) so >260-char paths work.
+
+    Returns the path unchanged on non-Windows or if already prefixed."""
+    if os.name != "nt" or not path:
+        return path
+    full = os.path.abspath(path)
+    return full if full.startswith("\\\\?\\") else "\\\\?\\" + full
+
+
+def exists_on_disk(path: str) -> bool:
+    """Robust file-existence check that tolerates Windows >260-char paths,
+    which plain os.path.isfile reports as missing without the \\\\?\\ prefix."""
+    try:
+        if os.path.isfile(path):
+            return True
+    except OSError:
+        pass
+    if os.name == "nt":
+        try:
+            return os.path.isfile(long_path(path))
+        except OSError:
+            return False
+    return False
 
 
 class FileGoneError(Exception):
@@ -158,12 +185,11 @@ class FileSessionManager:
         source = row["source"]
         name = row["name"]
         if source in ("local", "onedrive"):
-            src = Path(row["path"])
-            if not src.is_file():
+            if not exists_on_disk(row["path"]):
                 raise FileGoneError("File missing on disk")
             dest = self._session_trash_dir(session_id) / source / f"{entry_id}_{name}"
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dest))
+            shutil.move(long_path(row["path"]), str(dest))
             return str(dest)
         trash_rel = f".indexhub-trash/{session_id}/{entry_id}_{name}"
         proc = subprocess.run(
@@ -189,9 +215,9 @@ class FileSessionManager:
             if not src.is_file():
                 raise ValueError("Trashed file missing; cannot restore")
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists():
+            if exists_on_disk(entry["original_path"]):
                 raise ValueError("Cannot restore: original path already occupied")
-            shutil.move(str(src), str(dest))
+            shutil.move(str(src), long_path(entry["original_path"]))
             return
         proc = subprocess.run(
             [mi.find_rclone(), "moveto",

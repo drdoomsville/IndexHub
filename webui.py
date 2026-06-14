@@ -1099,7 +1099,7 @@ const $ = id => document.getElementById(id);
 const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const params = new URLSearchParams(location.search);
 let mode = "name", page = 0, fileId = params.get("file_id") || "";
-let batch = false, lastGroups = [], curView = "checker", fromOverview = false;
+let batch = true, lastGroups = [], curView = "checker", fromOverview = false;
 function fmtSize(n) {
   if (n == null || n < 0) return "";
   const u = ["B","KB","MB","GB","TB"]; let i = 0;
@@ -1152,6 +1152,7 @@ async function load() {
   $("prev").disabled = page === 0;
   $("next").disabled = page >= pages - 1;
   updateSelInfo();
+  if (batch) autoSelect();  // pre-select duplicates (keeping one per group)
   saveDupState();
   // If we drilled in from the Overview and just cleared the last copies of
   // this group, hop back to the Overview and refresh its numbers.
@@ -1370,8 +1371,7 @@ async function loadOverview() {
 // Jump from an Overview group straight into the Checker, anchored on that file.
 function openGroup(id) {
   fromOverview = true;  // so we can return to Overview once this group is cleared
-  fileId = String(id); mode = "hash"; page = 0; batch = false;
-  $("batchToggle").classList.remove("active"); $("batchbar").hidden = true;
+  fileId = String(id); mode = "hash"; page = 0;
   document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b.dataset.mode === "hash"));
   showView("checker");
   load();
@@ -1402,7 +1402,7 @@ const _ds = IH.loadState("dups") || {};
 if (!_hasUrl) {
   if (_ds.mode) mode = _ds.mode;
   if (typeof _ds.page === "number") page = _ds.page;
-  if (_ds.batch) batch = true;
+  if (typeof _ds.batch === "boolean") batch = _ds.batch;
   if (_ds.fileId) fileId = _ds.fileId;
   if (_ds.fq != null) $("fq").value = _ds.fq;
   if (_ds.fsource != null) $("fsource").value = _ds.fsource;
@@ -2195,7 +2195,8 @@ def api_prune_missing():
         rows = conn.execute(
             "SELECT id, path FROM files WHERE source IN ('local', 'onedrive')"
         ).fetchall()
-        gone = [r["id"] for r in rows if not Path(r["path"]).is_file()]
+        gone = [r["id"] for r in rows
+                if not file_ops.exists_on_disk(r["path"])]
         for i in range(0, len(gone), 500):
             chunk = gone[i:i + 500]
             conn.execute(
