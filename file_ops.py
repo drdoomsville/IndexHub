@@ -483,6 +483,165 @@ class DeleteJobManager:
 delete_jobs = DeleteJobManager()
 
 
+class OrganizeJobManager:
+    """Runs a Media Org organize-or-undo pass on a single background worker.
+    Mirrors DeleteJobManager: one job at a time, a status snapshot for the
+    progress bar, and a cancel that stops the queue (the in-flight move
+    finishes — a remote move can't be safely interrupted)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._state = self._idle()
+
+    @staticmethod
+    def _idle() -> dict:
+        return {"running": False, "mode": "", "source": "", "batch_id": "",
+                "total": 0, "moved": 0, "skipped": 0, "failed": 0,
+                "current": "", "started_at": None, "finished_at": None,
+                "errors": [], "cancelled": False}
+
+    def status(self) -> dict:
+        with self._lock:
+            return dict(self._state)
+
+    def cancel(self) -> bool:
+        with self._lock:
+            if not self._state["running"]:
+                return False
+            self._state["cancelled"] = True
+            return True
+
+    def enqueue_organize(self, source: str) -> str:
+        batch_id = f"{source}-{_now()}"
+        with self._lock:
+            if self._state["running"]:
+                raise ValueError("A Media Org job is already running")
+            self._state = self._idle()
+            self._state.update(running=True, mode="organize", source=source,
+                               batch_id=batch_id, started_at=_now())
+            self._thread = threading.Thread(
+                target=self._run_organize, args=(source, batch_id), daemon=True)
+            self._thread.start()
+        return batch_id
+
+    def enqueue_undo(self, batch_id: str) -> None:
+        with self._lock:
+            if self._state["running"]:
+                raise ValueError("A Media Org job is already running")
+            self._state = self._idle()
+            self._state.update(running=True, mode="undo", batch_id=batch_id,
+                               started_at=_now())
+            self._thread = threading.Thread(
+                target=self._run_undo, args=(batch_id,), daemon=True)
+            self._thread.start()
+
+    # -- internal helpers (all take the lock) --
+    def _cancelled(self) -> bool:
+        with self._lock:
+            return self._state["cancelled"]
+
+    def _set(self, **kw):
+        with self._lock:
+            for k, v in kw.items():
+                self._state[k] = v
+
+    def _inc(self, key: str):
+        with self._lock:
+            self._state[key] += 1
+
+    def _err(self, msg: str):
+        with self._lock:
+            self._state["failed"] += 1
+            if len(self._state["errors"]) < 20:
+                self._state["errors"].append(msg)
+
+    def _finish(self):
+        with self._lock:
+            self._state["running"] = False
+            self._state["current"] = ""
+            self._state["finished_at"] = _now()
+
+    def _run_organize(self, source: str, batch_id: str):
+        db = mi.get_db()
+        db.row_factory = sqlite3.Row
+        try:
+            rows = db.execute(
+                "SELECT id, path, name, kind FROM files WHERE source = ?",
+                (source,)).fetchall()
+            todo = [r for r in rows if ORGANIZE_BUCKETS.get(r["kind"])
+                    and not _already_sorted(source, r["path"])]
+            self._set(total=len(todo))
+            for r in todo:
+                if self._cancelled():
+                    break
+                self._set(current=r["name"])
+                src = r["path"]
+                if source in ("local", "onedrive"):
+                    if not exists_on_disk(src) or is_cloud_placeholder(src):
+                        self._inc("skipped")
+                        continue
+                try:
+                    bucket = ORGANIZE_BUCKETS[r["kind"]]
+                    dest = _uniquify(source, _dest_path(source, bucket, r["name"]))
+                    _move_path(source, src, dest)
+                    name = _base_name(source, dest)
+                    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+                    # Record the move first so undo always has the new_path,
+                    # then point the index at the new location.
+                    mi._write_with_retry(db,
+                        "INSERT INTO media_org_moves (batch_id, source, file_id, "
+                        "original_path, new_path, moved_at, undone) VALUES (?,?,?,?,?,?,0)",
+                        (batch_id, source, str(r["id"]), src, dest, _now()))
+                    mi._write_with_retry(db,
+                        "UPDATE files SET path=?, name=?, ext=? WHERE id=?",
+                        (dest, name, ext, r["id"]))
+                    self._inc("moved")
+                except Exception as exc:
+                    self._err(f"{r['name']}: {exc}")
+        finally:
+            db.close()
+            self._finish()
+
+    def _run_undo(self, batch_id: str):
+        db = mi.get_db()
+        db.row_factory = sqlite3.Row
+        try:
+            rows = db.execute(
+                "SELECT id, source, file_id, original_path, new_path "
+                "FROM media_org_moves WHERE batch_id=? AND undone=0", (batch_id,)).fetchall()
+            self._set(total=len(rows), source=(rows[0]["source"] if rows else ""))
+            for r in rows:
+                if self._cancelled():
+                    break
+                source = r["source"]
+                self._set(current=_base_name(source, r["new_path"]))
+                try:
+                    if source in ("local", "onedrive") and not exists_on_disk(r["new_path"]):
+                        # Already gone from the sorted location; just clear the log.
+                        mi._write_with_retry(db,
+                            "UPDATE media_org_moves SET undone=1 WHERE id=?", (r["id"],))
+                        self._inc("skipped")
+                        continue
+                    _move_path(source, r["new_path"], r["original_path"])
+                    name = _base_name(source, r["original_path"])
+                    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+                    mi._write_with_retry(db,
+                        "UPDATE files SET path=?, name=?, ext=? WHERE id=?",
+                        (r["original_path"], name, ext, int(r["file_id"])))
+                    mi._write_with_retry(db,
+                        "UPDATE media_org_moves SET undone=1 WHERE id=?", (r["id"],))
+                    self._inc("moved")
+                except Exception as exc:
+                    self._err(f"undo {r['new_path']}: {exc}")
+        finally:
+            db.close()
+            self._finish()
+
+
+organize_jobs = OrganizeJobManager()
+
+
 def parse_session_id(cookie_header: str | None) -> tuple[str, bool]:
     """Return (session_id, is_new)."""
     if cookie_header:
