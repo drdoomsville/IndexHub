@@ -981,6 +981,9 @@ DUPS_HTML = """<!DOCTYPE html>
   .viewtabs button.active { color:var(--accent); border-bottom-color:var(--accent); }
   /* Overview tab (merged duplicate report), scoped so it can't clash with the checker */
   #view-overview h2 { font-size:15px; font-weight:600; margin:26px 0 10px; color:var(--text); }
+  #view-overview h2.collapsible { cursor:pointer; user-select:none; }
+  #view-overview h2.collapsible::before { content:"\\25be "; color:var(--muted); font-size:12px; }
+  #view-overview h2.collapsible.collapsed::before { content:"\\25b8 "; }
   #view-overview .controls { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
   #view-overview select { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px; padding:7px 10px; font-size:13px; }
   #view-overview .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:6px; }
@@ -1069,12 +1072,12 @@ DUPS_HTML = """<!DOCTYPE html>
       </select>
     </div>
     <div class="cards" id="cards"></div>
-    <h2>Reclaimable space by file size</h2>
+    <h2 class="collapsible" data-target="buckets">Reclaimable space by file size</h2>
     <table id="buckets"><thead><tr>
       <th>Per-file size</th><th class="num">Groups</th><th class="num">Removable copies</th>
       <th class="num">Reclaimable</th><th style="width:30%">Share</th>
     </tr></thead><tbody></tbody></table>
-    <h2>By source</h2>
+    <h2 class="collapsible" data-target="persource">By source</h2>
     <table id="persource"><thead><tr>
       <th>Source</th><th class="num">Hashed files</th><th class="num">Dup groups</th>
       <th class="num">Removable copies</th><th class="num">Reclaimable</th>
@@ -1383,6 +1386,14 @@ function showView(v) {
 }
 $("scope").onchange = () => { saveDupState(); loadOverview(); };
 document.querySelectorAll(".viewtabs button").forEach(b => b.onclick = () => { fromOverview = false; showView(b.dataset.view); });
+document.querySelectorAll("#view-overview h2.collapsible").forEach(h => {
+  h.onclick = () => {
+    const t = $(h.dataset.target);
+    const hide = t.style.display !== "none";
+    t.style.display = hide ? "none" : "";
+    h.classList.toggle("collapsed", hide);
+  };
+});
 if (params.get("mode")) mode = params.get("mode");
 // Restore the last view (mode, filters, batch toggle, scroll) unless the URL
 // carries an explicit anchor/mode deep-link, which always wins.
