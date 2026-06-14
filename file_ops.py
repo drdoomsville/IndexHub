@@ -300,13 +300,23 @@ class DeleteJobManager:
     def _idle() -> dict:
         return {"running": False, "total": 0, "deleted": 0, "pruned": 0,
                 "failed": 0, "current": "", "started_at": None,
-                "finished_at": None, "errors": []}
+                "finished_at": None, "errors": [], "cancelled": False}
 
     def status(self) -> dict:
         with self._lock:
             s = dict(self._state)
             s["queued"] = len(self._queue)
             return s
+
+    def cancel(self) -> bool:
+        """Drop everything still queued. The file currently being moved is
+        allowed to finish (a remote move can't be safely interrupted)."""
+        with self._lock:
+            if not self._state["running"]:
+                return False
+            self._queue = []
+            self._state["cancelled"] = True
+            return True
 
     def enqueue(self, session_id: str, ids: list) -> int:
         ids = [str(i) for i in ids]

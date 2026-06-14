@@ -1565,23 +1565,32 @@ window.IH = (function () {
   function onDeleteComplete(fn) { _onDone = fn; }
   function pollDeletes() {
     if (_delTimer) return;
+    var cancelBtn = document.getElementById("ih-delcancel");
+    if (cancelBtn && !cancelBtn._wired) {
+      cancelBtn._wired = true;
+      cancelBtn.onclick = function () {
+        cancelBtn.disabled = true;
+        fetch("/api/delete/cancel", { method: "POST" }).catch(function () {});
+      };
+    }
     _delTimer = setInterval(_tickDeletes, 1000);
     _tickDeletes();
   }
   function _tickDeletes() {
     fetch("/api/delete/status").then(function (r) { return r.json(); }).then(function (s) {
       var bar = document.getElementById("ih-delbar");
+      var msg = document.getElementById("ih-delmsg");
       var processed = (s.deleted || 0) + (s.pruned || 0) + (s.failed || 0);
       if (s.running) {
-        if (bar) {
-          bar.hidden = false;
-          bar.textContent = "Deleting " + processed + " of " + (s.total || 0)
-            + (s.current ? " \\u2014 " + s.current : "")
-            + (s.failed ? "  (" + s.failed + " failed)" : "");
-        }
+        if (bar) bar.hidden = false;
+        if (msg) msg.textContent = (s.cancelled ? "Cancelling\\u2026 " : "Deleting ")
+          + processed + " of " + (s.total || 0)
+          + (s.current ? " \\u2014 " + s.current : "")
+          + (s.failed ? "  (" + s.failed + " failed)" : "");
       } else {
         if (_delTimer) { clearInterval(_delTimer); _delTimer = null; }
         if (bar) bar.hidden = true;
+        var cb2 = document.getElementById("ih-delcancel"); if (cb2) cb2.disabled = false;
         bustCache();
         var cb = _onDone; _onDone = null;
         if (cb) cb(s);
@@ -1598,7 +1607,12 @@ window.IH = (function () {
 _DELBAR = (
     '<div id="ih-delbar" hidden style="position:fixed;top:0;left:0;right:0;'
     "z-index:50;background:#3a2330;color:#ffb3c1;border-bottom:1px solid #5a3344;"
-    'padding:8px 16px;font-size:13px;text-align:center;font-weight:600"></div>'
+    'padding:8px 16px;font-size:13px;text-align:center;font-weight:600">'
+    '<span id="ih-delmsg"></span>'
+    '<button id="ih-delcancel" style="margin-left:12px;background:#5a3344;'
+    "color:#ffd0d8;border:1px solid #7a4456;border-radius:6px;padding:2px 10px;"
+    'font-size:12px;cursor:pointer;font-weight:600">Cancel</button>'
+    "</div>"
 )
 
 
@@ -2211,6 +2225,10 @@ def api_delete_status():
     return file_ops.delete_jobs.status()
 
 
+def api_delete_cancel():
+    return {"ok": file_ops.delete_jobs.cancel()}
+
+
 def api_prune_missing():
     """Remove index rows for local/OneDrive files that no longer exist on disk.
 
@@ -2372,6 +2390,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if url.path == "/api/scan/cancel":
             self._json(api_scan_cancel())
+            return
+        if url.path == "/api/delete/cancel":
+            self._json(api_delete_cancel())
             return
         if url.path == "/api/mark-delete":
             try:
