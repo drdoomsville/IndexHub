@@ -18,6 +18,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -586,12 +587,14 @@ def _migrate_files_table(db: sqlite3.Connection):
     """)
 
 
-def get_db() -> sqlite3.Connection:
-    # 30s busy timeout: a delete/rename must wait out a scan job's commit
-    # instead of failing with "database is locked". WAL keeps readers from
-    # ever blocking on writers.
-    db = sqlite3.connect(DB_PATH, timeout=30)
-    db.execute("PRAGMA journal_mode=WAL")
+_schema_lock = threading.Lock()
+_schema_ready = False
+
+
+def _init_schema(db: sqlite3.Connection) -> None:
+    """Create/migrate the schema and indexes. Runs once per process — doing it
+    on every connection makes every request (even reads) take a write lock,
+    which collides with a running scan and yields 'database is locked'."""
     db.executescript(SCHEMA)
     cols = {row[1] for row in db.execute("PRAGMA table_info(files)")}
     if "category" not in cols:
@@ -615,6 +618,22 @@ def get_db() -> sqlite3.Connection:
     db.execute("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files (content_hash)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_files_name_lower ON files (name COLLATE NOCASE)")
     db.commit()
+
+
+def get_db() -> sqlite3.Connection:
+    # 30s busy timeout: a delete/rename must wait out a scan job's commit
+    # instead of failing with "database is locked". WAL keeps readers from
+    # ever blocking on writers — but only if connections don't themselves
+    # write, so the schema/migration DDL runs once (below), not per connection.
+    global _schema_ready
+    db = sqlite3.connect(DB_PATH, timeout=30)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=30000")
+    if not _schema_ready:
+        with _schema_lock:
+            if not _schema_ready:
+                _init_schema(db)
+                _schema_ready = True
     return db
 
 
