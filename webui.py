@@ -114,6 +114,10 @@ APP_HTML = """<!DOCTYPE html>
     display: flex; flex-direction: column; max-height: 45vh; }
   .trash-bar h3 { font-size: 13px; color: var(--muted); margin-bottom: 8px; flex: 0 0 auto; }
   #trashList { overflow-y: auto; min-height: 0; }
+  #trashList.collapsed .trash-item:nth-child(n+5) { display: none; }
+  #trashToggle { align-self: flex-start; margin-top: 6px; background: none; border: none;
+    color: var(--accent); cursor: pointer; font-size: 12.5px; padding: 2px 0; }
+  #trashToggle:hover { text-decoration: underline; }
   .trash-item { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
     padding: 6px 0; border-bottom: 1px solid #2a2230; font-size: 13px; }
   .trash-item .nm { flex: 1; min-width: 140px; word-break: break-all; }
@@ -267,6 +271,7 @@ APP_HTML = """<!DOCTYPE html>
 <div class="trash-bar" id="trashBar" hidden>
   <h3>Session trash &mdash; restore before closing the browser</h3>
   <div id="trashList"></div>
+  <button id="trashToggle" type="button" hidden></button>
 </div>
 <script>
 const PAGE = __CONFIG__;
@@ -518,8 +523,25 @@ async function loadTrash() {
       <span class="meta">${esc(it.source)} \u00b7 ${esc(it.original_path)}</span>
       <button type="button" data-restore="${esc(it.entry_id)}">Restore</button>
     </div>`).join("");
+  applyTrashCollapse(d.items.length);
+}
+let trashExpanded = false;
+function applyTrashCollapse(count) {
+  const bar = $("trashBar"), list = $("trashList"), toggle = $("trashToggle");
+  if (count > 4) {
+    toggle.hidden = false;
+    list.classList.toggle("collapsed", !trashExpanded);
+    toggle.textContent = trashExpanded ? "Show less" : `Show all ${count}`;
+  } else {
+    toggle.hidden = true;
+    list.classList.remove("collapsed");
+  }
   document.body.style.paddingBottom = bar.offsetHeight + "px";
 }
+$("trashToggle").onclick = () => {
+  trashExpanded = !trashExpanded;
+  applyTrashCollapse(document.querySelectorAll("#trashList .trash-item").length);
+};
 $("trashList").addEventListener("click", async e => {
   const id = e.target.dataset.restore;
   if (!id) return;
@@ -911,6 +933,10 @@ DUPS_HTML = """<!DOCTYPE html>
     display:flex; flex-direction:column; }
   .trash-bar h3 { font-size:13px; color:#46c08a; margin-bottom:6px; font-weight:600; flex:0 0 auto; }
   #trashList { overflow-y:auto; min-height:0; }
+  #trashList.collapsed .trash-item:nth-child(n+5) { display:none; }
+  #trashToggle { align-self:flex-start; margin-top:6px; background:none; border:none;
+    color:var(--accent); cursor:pointer; font-size:12.5px; padding:2px 0; }
+  #trashToggle:hover { text-decoration:underline; }
   .trash-item { display:flex; gap:10px; align-items:center; font-size:12.5px; padding:3px 0; }
   .trash-item .nm { color:var(--text); }
   .trash-item .meta { color:var(--muted); font-family:Consolas,monospace; font-size:11px; word-break:break-all; flex:1; }
@@ -1039,6 +1065,7 @@ DUPS_HTML = """<!DOCTYPE html>
 <div class="trash-bar" id="trashBar" hidden>
   <h3>Session trash &mdash; restore before closing the browser</h3>
   <div id="trashList"></div>
+  <button id="trashToggle" type="button" hidden></button>
 </div>
 <script>
 const $ = id => document.getElementById(id);
@@ -1153,9 +1180,11 @@ async function deleteSelected() {
   })).json();
   $("delSel").textContent = "Delete selected";
   if (res.ok) {
+    const _notes = [];
+    if (res.pruned) _notes.push(`${res.pruned} were already gone \u2014 removed from the index`);
     if (res.failed && res.failed.length)
-      alert(`Deleted ${res.deleted} of ${res.requested}. ${res.failed.length} failed:\\n` +
-            res.failed.slice(0, 6).map(f => "\u2022 " + f.error).join("\\n"));
+      _notes.push(`${res.failed.length} failed:\\n` + res.failed.slice(0, 6).map(f => "\u2022 " + f.error).join("\\n"));
+    if (_notes.length) alert(`Deleted ${res.deleted} of ${res.requested}.\\n` + _notes.join("\\n"));
     IH.bustCache(); loadTrash(); load();
   } else { alert(res.error || "Batch delete failed"); $("delSel").disabled = false; }
 }
@@ -1210,8 +1239,25 @@ async function loadTrash() {
       <span class="meta">${esc(it.source)} \u00b7 ${esc(it.original_path)}</span>
       <button class="reveal-btn" data-restore="${esc(it.entry_id)}">Restore</button>
     </div>`).join("");
+  applyTrashCollapse(d.items.length);
+}
+let trashExpanded = false;
+function applyTrashCollapse(count) {
+  const bar = $("trashBar"), list = $("trashList"), toggle = $("trashToggle"), wrap = document.querySelector(".wrap");
+  if (count > 4) {
+    toggle.hidden = false;
+    list.classList.toggle("collapsed", !trashExpanded);
+    toggle.textContent = trashExpanded ? "Show less" : `Show all ${count}`;
+  } else {
+    toggle.hidden = true;
+    list.classList.remove("collapsed");
+  }
   wrap.style.paddingBottom = bar.offsetHeight + "px";
 }
+$("trashToggle").onclick = () => {
+  trashExpanded = !trashExpanded;
+  applyTrashCollapse(document.querySelectorAll("#trashList .trash-item").length);
+};
 $("trashList").addEventListener("click", async e => {
   const b = e.target.closest("[data-restore]");
   if (!b) return;
@@ -1921,7 +1967,8 @@ def api_duplicates(params):
     file_id = params.get("file_id", [""])[0].strip()
 
     conn = db()
-    mi.backfill_meta_fingerprints(conn)
+    if mode == "meta":
+        mi.backfill_meta_fingerprints(conn)
     anchor = None
 
     if file_id:
@@ -1978,32 +2025,27 @@ def api_duplicates(params):
         f"GROUP BY k HAVING COUNT(*) > 1)", frag_args
     ).fetchone()[0]
 
-    keys = [r[0] for r in conn.execute(
-        f"SELECT k FROM ("
+    key_rows = conn.execute(
+        f"SELECT k, c FROM ("
         f"SELECT {key_expr} k, COUNT(*) c FROM files WHERE {where_full} "
         f"GROUP BY k HAVING c > 1) ORDER BY c DESC, k LIMIT ? OFFSET ?",
-        frag_args + [limit, page * limit])]
+        frag_args + [limit, page * limit]).fetchall()
 
     groups = []
-    for key_val in keys:
-        if mode == "name":
-            rows = conn.execute(
-                f"SELECT * FROM files WHERE LOWER(name) = ?{frag} ORDER BY source, name",
-                [key_val] + frag_args).fetchall()
-            label = rows[0]["name"] if rows else key_val
-        else:
-            rows = conn.execute(
-                f"SELECT * FROM files WHERE {key_expr} = ?{frag} ORDER BY source, name",
-                [key_val] + frag_args).fetchall()
-            label = key_val
-        # Cap files per group in the payload: a few hash groups can hold
-        # thousands of identical files, which bloats the response and freezes
-        # the browser. "count" stays the true total; the UI shows "+N more".
+    for key_val, count in key_rows:
+        # Fetch only the capped slice, not every row in the group; the true
+        # total comes from the grouped count above. Groups can be huge
+        # (thousands of identical files), so this avoids a heavy fetchall and
+        # the resulting oversized payload.
+        rows = conn.execute(
+            f"SELECT * FROM files WHERE {key_expr} = ?{frag} ORDER BY source, name LIMIT ?",
+            [key_val] + frag_args + [GROUP_FILE_CAP]).fetchall()
+        label = rows[0]["name"] if (mode == "name" and rows) else key_val
         groups.append({
             "key": key_val,
             "label": label,
-            "count": len(rows),
-            "files": [_file_brief(r) for r in rows[:GROUP_FILE_CAP]],
+            "count": count,
+            "files": [_file_brief(r) for r in rows],
         })
     conn.close()
     return {
@@ -2079,18 +2121,21 @@ def api_delete_batch(body, session_id: str):
     if len(ids) > 5000:
         return {"ok": False, "error": "Too many files in one batch (max 5000)"}
     conn = db()
-    deleted, failed = [], []
+    deleted, pruned, failed = [], 0, []
     try:
         for fid in ids:
             try:
                 res = file_ops.file_sessions.delete_file(conn, session_id, str(fid))
-                deleted.append(res["entry"]["entry_id"])
+                if res.get("pruned"):
+                    pruned += 1  # file was already gone; stale row removed
+                else:
+                    deleted.append(res["entry"]["entry_id"])
             except Exception as exc:
                 failed.append({"id": fid, "error": str(exc)})
     finally:
         conn.close()
-    return {"ok": True, "deleted": len(deleted), "failed": failed,
-            "requested": len(ids)}
+    return {"ok": True, "deleted": len(deleted), "pruned": pruned,
+            "failed": failed, "requested": len(ids)}
 
 
 def api_ingest(body, token_ok: bool):

@@ -15,6 +15,11 @@ import media_index as mi
 TRASH_ROOT = Path(__file__).parent / ".trash"
 
 
+class FileGoneError(Exception):
+    """The file is already gone from disk, so there's nothing to trash —
+    the stale index row should just be pruned."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -67,6 +72,13 @@ class FileSessionManager:
         db.execute("DELETE FROM files WHERE id = ?", (file_id,))
         try:
             trash_path = self._move_to_trash(session_id, entry_id, row)
+        except FileGoneError:
+            # The file is already gone from disk — keep the DELETE (prune the
+            # stale index row) instead of rolling back. Nothing to restore, so
+            # no trash entry is created.
+            db.commit()
+            return {"ok": True, "pruned": True, "name": row["name"],
+                    "source": row["source"], "original_path": row["path"]}
         except BaseException:
             db.rollback()
             raise
@@ -148,7 +160,7 @@ class FileSessionManager:
         if source in ("local", "onedrive"):
             src = Path(row["path"])
             if not src.is_file():
-                raise ValueError("File missing on disk")
+                raise FileGoneError("File missing on disk")
             dest = self._session_trash_dir(session_id) / source / f"{entry_id}_{name}"
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dest))
@@ -161,7 +173,12 @@ class FileSessionManager:
             capture_output=True, text=True, encoding="utf-8",
         )
         if proc.returncode != 0:
-            raise ValueError(f"Delete failed: {proc.stderr.strip()[:300]}")
+            err = proc.stderr.strip()
+            low = err.lower()
+            if ("not found" in low or "doesn't exist" in low
+                    or "does not exist" in low or "no such" in low):
+                raise FileGoneError("File missing on remote")
+            raise ValueError(f"Delete failed: {err[:300]}")
         return trash_rel
 
     def _restore_from_trash(self, entry: dict):
