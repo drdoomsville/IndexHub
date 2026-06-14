@@ -141,6 +141,27 @@ def reveal_path(source: str, rel_path: str) -> str | None:
     return None
 
 
+def gdrive_web_url(rel_path: str) -> str | None:
+    """Resolve a gdrive file's Google Drive web URL via its Drive ID.
+
+    Uses `rclone lsjson` (a read-only call, so it works regardless of the
+    remote's write scope). Returns None if the file or its ID can't be found."""
+    try:
+        proc = subprocess.run(
+            [find_rclone(), "lsjson", rclone_full_path("gdrive", rel_path)],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+        )
+        if proc.returncode != 0:
+            return None
+        data = json.loads(proc.stdout or "[]")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    for entry in data:
+        if not entry.get("IsDir") and entry.get("ID"):
+            return f"https://drive.google.com/file/d/{entry['ID']}/view"
+    return None
+
+
 def scan_qnap(cancel_event=None, path_prefix: str = ""):
     """Yield media file rows from QNAP via rclone SMB lsf (streaming)."""
     cfg = load_qnap_config()

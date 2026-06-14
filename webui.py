@@ -577,7 +577,8 @@ $("revealBtn").onclick = async () => {
     body: JSON.stringify({id: sel.id}),
   })).json();
   if (res.ok) {
-    $("opsmsg").textContent = "Opened in Explorer \u2713";
+    if (res.url) { window.open(res.url, "_blank"); $("opsmsg").textContent = "Opened in Google Drive \u2713"; }
+    else { $("opsmsg").textContent = "Opened in Explorer \u2713"; }
     $("opsmsg").className = "opsmsg ok";
   } else {
     $("opsmsg").textContent = res.error || "Open folder failed";
@@ -1246,7 +1247,8 @@ $("groups").addEventListener("click", async e => {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({id: +rev.dataset.reveal}),
     })).json();
-    if (!res.ok) alert(res.error || "Open folder failed");
+    if (res.ok && res.url) window.open(res.url, "_blank");
+    else if (!res.ok) alert(res.error || "Open folder failed");
     rev.textContent = orig; rev.disabled = false;
     return;
   }
@@ -1329,7 +1331,8 @@ let _ovLoaded = false;
 async function revealPath(id, btn) {
   const orig = btn.textContent; btn.textContent = "Opening…"; btn.disabled = true;
   const res = await (await fetch("/api/reveal", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})})).json();
-  if (!res.ok) alert(res.error || "Open folder failed");
+  if (res.ok && res.url) window.open(res.url, "_blank");
+  else if (!res.ok) alert(res.error || "Open folder failed");
   btn.textContent = orig; btn.disabled = false;
 }
 async function loadOverview() {
@@ -2304,6 +2307,11 @@ def api_reveal(body):
     row = get_file_row(body.get("id"))
     if not row:
         return {"ok": False, "error": "File not found in index"}
+    if row["source"] == "gdrive":
+        url = mi.gdrive_web_url(row["path"])
+        if url:
+            return {"ok": True, "url": url}
+        return {"ok": False, "error": "Could not resolve the Google Drive link"}
     target = mi.reveal_path(row["source"], row["path"])
     if not target:
         label = "Google Drive" if row["source"] == "gdrive" else row["source"]
