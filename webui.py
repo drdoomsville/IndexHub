@@ -26,6 +26,9 @@ import file_ops
 DB_PATH = Path(__file__).parent / "media_index.db"
 PAGE_SIZE = 100
 CHUNK = 256 * 1024
+# Max files returned per duplicate group; a few hash groups can hold thousands
+# of identical copies, and shipping/rendering them all freezes the browser.
+GROUP_FILE_CAP = 50
 
 # Set from CLI args in main(); the footer reads these to advertise the LAN URL.
 BIND_HOST = "127.0.0.1"
@@ -107,9 +110,10 @@ APP_HTML = """<!DOCTYPE html>
   tr.marked td { opacity: .72; }
   tr.marked td:first-child { text-decoration: line-through; color: var(--video); }
   .trash-bar { position: fixed; left: 0; right: 0; bottom: 0; background: #1a1520;
-    border-top: 1px solid #4a3040; padding: 10px 20px; z-index: 20; max-height: 38vh;
-    overflow: auto; }
-  .trash-bar h3 { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+    border-top: 1px solid #4a3040; padding: 10px 20px; z-index: 20;
+    display: flex; flex-direction: column; max-height: 45vh; }
+  .trash-bar h3 { font-size: 13px; color: var(--muted); margin-bottom: 8px; flex: 0 0 auto; }
+  #trashList { overflow-y: auto; min-height: 0; }
   .trash-item { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
     padding: 6px 0; border-bottom: 1px solid #2a2230; font-size: 13px; }
   .trash-item .nm { flex: 1; min-width: 140px; word-break: break-all; }
@@ -503,6 +507,7 @@ async function loadTrash() {
   if (!d.items.length) {
     bar.hidden = true;
     document.body.classList.remove("has-trash");
+    document.body.style.paddingBottom = "";
     return;
   }
   bar.hidden = false;
@@ -513,6 +518,7 @@ async function loadTrash() {
       <span class="meta">${esc(it.source)} \u00b7 ${esc(it.original_path)}</span>
       <button type="button" data-restore="${esc(it.entry_id)}">Restore</button>
     </div>`).join("");
+  document.body.style.paddingBottom = bar.offsetHeight + "px";
 }
 $("trashList").addEventListener("click", async e => {
   const id = e.target.dataset.restore;
@@ -741,16 +747,9 @@ LANDING_HTML = """<!DOCTYPE html>
     </a>
     <a class="bigcard" href="/duplicates">
       <div class="icon">&#128257;</div>
-      <h2>Duplicate Checker</h2>
-      <div class="desc">Find matches by filename, metadata fingerprint, or content hash</div>
+      <h2>Duplicates</h2>
+      <div class="desc">Find matches by name, metadata, or content hash &mdash; with the reclaimable-space report</div>
       <div class="stats" id="dup-stats">Loading&hellip;</div>
-      <span class="open">Open &rarr;</span>
-    </a>
-    <a class="bigcard" href="/duplicates/report">
-      <div class="icon">&#128202;</div>
-      <h2>Duplicate Report</h2>
-      <div class="desc">Reclaimable space, size breakdown, and the biggest duplicate groups</div>
-      <div class="stats" id="report-stats">Loading&hellip;</div>
       <span class="open">Open &rarr;</span>
     </a>
   </div>
@@ -793,21 +792,17 @@ for (const domain of ["media", "documents"]) {
       `<span style="font-size:12.5px">${cats || "&nbsp;"}</span>`;
   });
 }
-IH.cachedFetch("/api/duplicates/summary").then(s => {
+Promise.all([
+  IH.cachedFetch("/api/duplicates/summary"),
+  IH.cachedFetch("/api/duplicates/report"),
+]).then(([s, d]) => {
   document.getElementById("dup-stats").innerHTML =
-    `<b>${s.groups.toLocaleString()}</b> duplicate groups \u00b7 ` +
+    `<b>${s.groups.toLocaleString()}</b> duplicate groups \u00b7 <b>${fmtSize(d.reclaim)}</b> reclaimable<br>` +
     `<span style="font-size:12.5px">${s.hashed.toLocaleString()} hashed / ${s.total.toLocaleString()} indexed` +
     (s.possible ? ` \u00b7 ${s.possible.toLocaleString()} large files for manual review` : "") +
     `</span>`;
 }).catch(() => {
   document.getElementById("dup-stats").textContent = "Open to scan for duplicates";
-});
-IH.cachedFetch("/api/duplicates/report").then(d => {
-  document.getElementById("report-stats").innerHTML =
-    `<b>${fmtSize(d.reclaim)}</b> reclaimable · ` +
-    `<span style="font-size:12.5px">${d.redundant.toLocaleString()} removable copies in ${d.groups.toLocaleString()} groups</span>`;
-}).catch(() => {
-  document.getElementById("report-stats").textContent = "Open to view the report";
 });
 let scanPoll;
 async function refreshScanStatus() {
@@ -865,7 +860,7 @@ DUPS_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Duplicate Checker</title>
 <style>
-  :root { --bg:#0f1115; --panel:#181b22; --panel2:#1f2330; --text:#e6e9f0; --muted:#8b93a7; --accent:#5b8cff; }
+  :root { --bg:#0f1115; --panel:#181b22; --panel2:#1f2330; --text:#e6e9f0; --muted:#8b93a7; --accent:#5b8cff; --good:#46c08a; }
   * { box-sizing:border-box; margin:0; }
   body { background:var(--bg); color:var(--text); font:14px/1.5 "Segoe UI", system-ui, sans-serif; }
   .wrap { max-width:1200px; margin:0 auto; padding:24px 20px 60px; }
@@ -887,6 +882,7 @@ DUPS_HTML = """<!DOCTYPE html>
   th { color:var(--muted); font-size:11px; text-transform:uppercase; }
   td.path { color:var(--muted); font-family:Consolas,monospace; font-size:12px; word-break:break-all; white-space:normal; }
   .empty { padding:40px; text-align:center; color:var(--muted); }
+  .more-row { color:var(--muted); font-size:12px; font-style:italic; }
   .pager { display:flex; gap:10px; align-items:center; margin-top:14px; color:var(--muted); }
   button { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px;
     padding:7px 16px; cursor:pointer; font-size:13.5px; }
@@ -911,8 +907,10 @@ DUPS_HTML = """<!DOCTYPE html>
   .lib-link:hover { text-decoration:underline; }
   .acts { display:flex; gap:6px; justify-content:flex-end; align-items:center; flex-wrap:wrap; }
   .trash-bar { position:fixed; bottom:0; left:0; right:0; background:#1a1d26; border-top:1px solid #2c3344;
-    padding:10px 18px; max-height:32vh; overflow:auto; box-shadow:0 -4px 14px rgba(0,0,0,.4); }
-  .trash-bar h3 { font-size:13px; color:#46c08a; margin-bottom:6px; font-weight:600; }
+    padding:10px 18px; max-height:45vh; box-shadow:0 -4px 14px rgba(0,0,0,.4);
+    display:flex; flex-direction:column; }
+  .trash-bar h3 { font-size:13px; color:#46c08a; margin-bottom:6px; font-weight:600; flex:0 0 auto; }
+  #trashList { overflow-y:auto; min-height:0; }
   .trash-item { display:flex; gap:10px; align-items:center; font-size:12.5px; padding:3px 0; }
   .trash-item .nm { color:var(--text); }
   .trash-item .meta { color:var(--muted); font-family:Consolas,monospace; font-size:11px; word-break:break-all; flex:1; }
@@ -925,13 +923,43 @@ DUPS_HTML = """<!DOCTYPE html>
   .selinfo b { color:var(--text); }
   td.cb, th.cb { width:34px; text-align:center; }
   td.cb input { width:16px; height:16px; cursor:pointer; }
+  /* Top-level view switcher (Checker vs. Overview) */
+  .viewtabs { display:flex; gap:4px; margin-bottom:16px; border-bottom:1px solid #262b38; }
+  .viewtabs button { background:none; border:none; border-bottom:2px solid transparent; color:var(--muted);
+    padding:9px 16px; cursor:pointer; font-size:14px; border-radius:0; }
+  .viewtabs button:hover:not(:disabled) { color:var(--text); border-color:transparent; }
+  .viewtabs button.active { color:var(--accent); border-bottom-color:var(--accent); }
+  /* Overview tab (merged duplicate report), scoped so it can't clash with the checker */
+  #view-overview h2 { font-size:15px; font-weight:600; margin:26px 0 10px; color:var(--text); }
+  #view-overview .controls { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  #view-overview select { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px; padding:7px 10px; font-size:13px; }
+  #view-overview .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:6px; }
+  #view-overview .card { background:var(--panel); border:1px solid #262b38; border-radius:12px; padding:14px 16px; }
+  #view-overview .card .num { font-size:24px; font-weight:700; }
+  #view-overview .card .num.hl { color:var(--good); }
+  #view-overview .card .lbl { color:var(--muted); font-size:12px; margin-top:2px; }
+  #view-overview table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid #262b38; border-radius:10px; overflow:hidden; }
+  #view-overview th, #view-overview td { text-align:left; padding:9px 12px; border-top:1px solid #232836; font-size:13px; }
+  #view-overview th { color:var(--muted); font-size:11px; text-transform:uppercase; border-top:none; background:var(--panel2); }
+  #view-overview td.num, #view-overview th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  #view-overview tr.clickable:hover { background:#1c2433; cursor:pointer; }
+  #view-overview .bar { height:7px; background:var(--panel2); border-radius:4px; overflow:hidden; margin-top:4px; }
+  #view-overview .bar > i { display:block; height:100%; background:var(--accent); }
+  #view-overview .src { display:inline-block; font-size:11px; color:var(--muted); }
+  #view-overview a.glink { color:var(--accent); text-decoration:none; cursor:pointer; }
+  #view-overview a.glink:hover { text-decoration:underline; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/duplicates/report">Report</a> &middot; <a href="/media">Media</a> &middot; <a href="/documents">Documents</a></div>
-  <h1>Duplicate <span>Checker</span></h1>
-  <div class="sub" id="sub">Cross-drive duplicate detection by filename, metadata fingerprint, and content hash.</div>
+  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/media">Media</a> &middot; <a href="/documents">Documents</a></div>
+  <h1>Dupli<span>cates</span></h1>
+  <div class="sub" id="sub">Find and remove duplicate files across your drives.</div>
+  <div class="viewtabs">
+    <button data-view="checker" class="active">Checker</button>
+    <button data-view="overview">Overview</button>
+  </div>
+  <div id="view-checker">
   <div class="tabs">
     <button data-mode="name" class="active">Filename</button>
     <button data-mode="meta">Metadata</button>
@@ -977,6 +1005,36 @@ DUPS_HTML = """<!DOCTYPE html>
     <span id="pageinfo"></span>
     <button id="next">Next &rarr;</button>
   </div>
+  </div><!-- /view-checker -->
+  <div id="view-overview" hidden>
+    <div class="sub" id="ovsub">Exact content-hash duplicates &mdash; every removable copy is byte-identical to a kept original.</div>
+    <div class="controls">
+      <label class="src">Scope:</label>
+      <select id="scope">
+        <option value="">All sources</option>
+        <option value="local">Local</option>
+        <option value="onedrive">OneDrive</option>
+        <option value="gdrive">Google Drive</option>
+        <option value="qnap">QNAP NAS</option>
+      </select>
+    </div>
+    <div class="cards" id="cards"></div>
+    <h2>Reclaimable space by file size</h2>
+    <table id="buckets"><thead><tr>
+      <th>Per-file size</th><th class="num">Groups</th><th class="num">Removable copies</th>
+      <th class="num">Reclaimable</th><th style="width:30%">Share</th>
+    </tr></thead><tbody></tbody></table>
+    <h2>By source</h2>
+    <table id="persource"><thead><tr>
+      <th>Source</th><th class="num">Hashed files</th><th class="num">Dup groups</th>
+      <th class="num">Removable copies</th><th class="num">Reclaimable</th>
+    </tr></thead><tbody></tbody></table>
+    <h2>Biggest duplicate groups</h2>
+    <table id="top"><thead><tr>
+      <th>File</th><th class="num">Copies</th><th class="num">Each</th>
+      <th class="num">Reclaimable</th><th></th>
+    </tr></thead><tbody></tbody></table>
+  </div>
 </div>
 <div class="trash-bar" id="trashBar" hidden>
   <h3>Session trash &mdash; restore before closing the browser</h3>
@@ -987,7 +1045,7 @@ const $ = id => document.getElementById(id);
 const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const params = new URLSearchParams(location.search);
 let mode = "name", page = 0, fileId = params.get("file_id") || "";
-let batch = false, lastGroups = [];
+let batch = false, lastGroups = [], curView = "checker";
 function fmtSize(n) {
   if (n == null || n < 0) return "";
   const u = ["B","KB","MB","GB","TB"]; let i = 0;
@@ -1012,11 +1070,18 @@ async function load() {
     $("anchor").hidden = true;
   }
   lastGroups = d.groups;
-  $("groups").innerHTML = d.groups.length ? d.groups.map(g => `
+  // Cap rendered rows per group: a few hash groups can hold thousands of
+  // identical files, and rendering them all at once freezes the page.
+  const ROW_CAP = 50;
+  $("groups").innerHTML = d.groups.length ? d.groups.map(g => {
+    const shown = g.files.slice(0, ROW_CAP);
+    const hidden = (g.count || g.files.length) - shown.length;
+    const cols = batch ? 7 : 6;
+    return `
     <div class="group">
       <div class="group-h"><b>${g.count} files</b> \u00b7 ${esc(g.label)}</div>
       <table><thead><tr>${batch ? '<th class="cb"></th>' : ""}<th>Name</th><th>Source</th><th>Size</th><th>Modified</th><th>Path</th><th></th></tr></thead>
-      <tbody>${g.files.map(f => `<tr data-row="${f.id}">
+      <tbody>${shown.map(f => `<tr data-row="${f.id}">
         ${batch ? `<td class="cb"><input type="checkbox" class="rowcb" data-id="${f.id}" data-group="${esc(String(g.key))}" data-size="${f.size || 0}"></td>` : ""}
         <td>${esc(f.name)}${f.possible_dupe ? ' <span class="flag">&ge;1 GB &middot; not hashed</span>' : ""}</td><td>${esc(f.source)}</td><td>${fmtSize(f.size)}</td>
         <td>${f.modified ? esc(f.modified.slice(0,10)) : ""}</td>
@@ -1025,8 +1090,9 @@ async function load() {
           <a class="lib-link" href="/${f.kind === "document" ? "documents" : "media"}?q=${encodeURIComponent(f.name)}&source=${encodeURIComponent(f.source)}" target="_blank" title="Open in the library with rename / move / delete">Library &#8599;</a>
           <button class="reveal-btn" data-reveal="${f.id}" title="Open containing folder in Explorer">&#128193;</button>
           <button class="del-btn" data-del="${f.id}" data-name="${esc(f.name)}" title="Delete to session trash (restorable)">Delete</button>
-        </td></tr>`).join("")}</tbody></table>
-    </div>`).join("") : `<div class="empty">No duplicate groups found for this filter.</div>`;
+        </td></tr>`).join("")}${hidden > 0 ? `<tr><td colspan="${cols}" class="more-row">+ ${hidden.toLocaleString()} more copies not shown \u2014 narrow with filters or open one in Library</td></tr>` : ""}</tbody></table>
+    </div>`;
+  }).join("") : `<div class="empty">No duplicate groups found for this filter.</div>`;
   const pages = Math.max(1, Math.ceil(d.total_groups / d.page_size));
   $("pageinfo").textContent = `${d.total_groups.toLocaleString()} group(s) \u00b7 page ${page + 1} of ${pages}`;
   $("prev").disabled = page === 0;
@@ -1036,7 +1102,7 @@ async function load() {
 }
 function saveDupState() {
   IH.saveState("dups", {
-    mode, page, batch, fileId,
+    mode, page, batch, fileId, view: curView, ovscope: $("scope").value,
     fq: $("fq").value, fsource: $("fsource").value,
     fsize: $("fsize").value, fpossible: $("fpossible").checked,
     scrollY: window.scrollY,
@@ -1135,8 +1201,8 @@ $("groups").addEventListener("click", async e => {
 });
 async function loadTrash() {
   const d = await (await fetch("/api/trash")).json();
-  const bar = $("trashBar"), list = $("trashList");
-  if (!d.items.length) { bar.hidden = true; document.body.classList.remove("has-trash"); return; }
+  const bar = $("trashBar"), list = $("trashList"), wrap = document.querySelector(".wrap");
+  if (!d.items.length) { bar.hidden = true; document.body.classList.remove("has-trash"); wrap.style.paddingBottom = ""; return; }
   bar.hidden = false; document.body.classList.add("has-trash");
   list.innerHTML = d.items.map(it => `
     <div class="trash-item">
@@ -1144,6 +1210,7 @@ async function loadTrash() {
       <span class="meta">${esc(it.source)} \u00b7 ${esc(it.original_path)}</span>
       <button class="reveal-btn" data-restore="${esc(it.entry_id)}">Restore</button>
     </div>`).join("");
+  wrap.style.paddingBottom = bar.offsetHeight + "px";
 }
 $("trashList").addEventListener("click", async e => {
   const b = e.target.closest("[data-restore]");
@@ -1175,124 +1242,16 @@ document.querySelectorAll(".tabs button").forEach(btn => {
 });
 $("prev").onclick = () => { page--; load(); };
 $("next").onclick = () => { page++; load(); };
-if (params.get("mode")) mode = params.get("mode");
-// Restore the last view (mode, filters, batch toggle, scroll) unless the URL
-// carries an explicit anchor/mode deep-link, which always wins.
-const _hasUrl = params.get("file_id") || params.get("mode");
-const _ds = IH.loadState("dups") || {};
-if (!_hasUrl) {
-  if (_ds.mode) mode = _ds.mode;
-  if (typeof _ds.page === "number") page = _ds.page;
-  if (_ds.batch) batch = true;
-  if (_ds.fileId) fileId = _ds.fileId;
-  if (_ds.fq != null) $("fq").value = _ds.fq;
-  if (_ds.fsource != null) $("fsource").value = _ds.fsource;
-  if (_ds.fsize != null) $("fsize").value = _ds.fsize;
-  if (_ds.fpossible) $("fpossible").checked = true;
-}
-if (batch) { $("batchToggle").classList.add("active"); $("batchbar").hidden = false; }
-document.querySelectorAll(".tabs button").forEach(b =>
-  b.classList.toggle("active", b.dataset.mode === mode));
-load().then(() => { if (!_hasUrl && _ds.scrollY) window.scrollTo(0, _ds.scrollY); });
-loadTrash();
-window.addEventListener("beforeunload", saveDupState);
-</script>
-</body>
-</html>
-"""
-
-DUP_REPORT_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Duplicate Report</title>
-<style>
-  :root { --bg:#0f1115; --panel:#181b22; --panel2:#1f2330; --text:#e6e9f0; --muted:#8b93a7; --accent:#5b8cff; --good:#46c08a; }
-  * { box-sizing:border-box; margin:0; }
-  body { background:var(--bg); color:var(--text); font:14px/1.5 "Segoe UI", system-ui, sans-serif; }
-  .wrap { max-width:1100px; margin:0 auto; padding:24px 20px 60px; }
-  h1 { font-size:22px; font-weight:600; }
-  h1 span { color:var(--accent); }
-  h2 { font-size:15px; font-weight:600; margin:26px 0 10px; color:var(--text); }
-  .sub { color:var(--muted); margin:4px 0 18px; font-size:13px; }
-  .topnav { margin-bottom:12px; }
-  .topnav a { color:var(--muted); text-decoration:none; font-size:13px; margin-right:8px; }
-  .topnav a:hover { color:var(--accent); }
-  .controls { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
-  select { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px; padding:7px 10px; font-size:13px; }
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:6px; }
-  .card { background:var(--panel); border:1px solid #262b38; border-radius:12px; padding:14px 16px; }
-  .card .num { font-size:24px; font-weight:700; }
-  .card .num.hl { color:var(--good); }
-  .card .lbl { color:var(--muted); font-size:12px; margin-top:2px; }
-  table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid #262b38; border-radius:10px; overflow:hidden; }
-  th, td { text-align:left; padding:9px 12px; border-top:1px solid #232836; font-size:13px; }
-  th { color:var(--muted); font-size:11px; text-transform:uppercase; border-top:none; background:var(--panel2); }
-  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
-  td.path { color:var(--muted); font-family:Consolas,monospace; font-size:12px; word-break:break-all; }
-  tr.clickable:hover { background:#1c2433; cursor:pointer; }
-  .bar { height:7px; background:var(--panel2); border-radius:4px; overflow:hidden; margin-top:4px; }
-  .bar > i { display:block; height:100%; background:var(--accent); }
-  .reveal-btn { background:var(--panel2); border:1px solid #2c3344; border-radius:7px; padding:4px 9px; font-size:12px; cursor:pointer; white-space:nowrap; color:var(--text); }
-  .reveal-btn:hover { border-color:var(--accent); color:var(--accent); }
-  .src { display:inline-block; font-size:11px; color:var(--muted); }
-  a.glink { color:var(--accent); text-decoration:none; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/duplicates">Duplicate checker</a> &middot; <a href="/media">Media</a> &middot; <a href="/documents">Documents</a></div>
-  <h1>Duplicate <span>Report</span></h1>
-  <div class="sub" id="sub">Exact content-hash duplicates &mdash; every removable copy is byte-identical to a kept original.</div>
-  <div class="controls">
-    <label class="src">Scope:</label>
-    <select id="scope">
-      <option value="">All sources</option>
-      <option value="local">Local</option>
-      <option value="onedrive">OneDrive</option>
-      <option value="gdrive">Google Drive</option>
-      <option value="qnap">QNAP NAS</option>
-    </select>
-  </div>
-
-  <div class="cards" id="cards"></div>
-
-  <h2>Reclaimable space by file size</h2>
-  <table id="buckets"><thead><tr>
-    <th>Per-file size</th><th class="num">Groups</th><th class="num">Removable copies</th>
-    <th class="num">Reclaimable</th><th style="width:30%">Share</th>
-  </tr></thead><tbody></tbody></table>
-
-  <h2>By source</h2>
-  <table id="persource"><thead><tr>
-    <th>Source</th><th class="num">Hashed files</th><th class="num">Dup groups</th>
-    <th class="num">Removable copies</th><th class="num">Reclaimable</th>
-  </tr></thead><tbody></tbody></table>
-
-  <h2>Biggest duplicate groups</h2>
-  <table id="top"><thead><tr>
-    <th>File</th><th class="num">Copies</th><th class="num">Each</th>
-    <th class="num">Reclaimable</th><th></th>
-  </tr></thead><tbody></tbody></table>
-</div>
-<script>
-const $ = id => document.getElementById(id);
-const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-function fmtSize(n) {
-  if (n == null || n < 0) return "";
-  const u = ["B","KB","MB","GB","TB"]; let i = 0;
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-  return n.toLocaleString(undefined, {maximumFractionDigits: 1}) + " " + u[i];
-}
+// ---- Overview tab (the merged duplicate report) ----
 const N = n => (n || 0).toLocaleString();
-async function reveal(id, btn) {
+let _ovLoaded = false;
+async function revealPath(id, btn) {
   const orig = btn.textContent; btn.textContent = "Opening…"; btn.disabled = true;
   const res = await (await fetch("/api/reveal", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})})).json();
   if (!res.ok) alert(res.error || "Open folder failed");
   btn.textContent = orig; btn.disabled = false;
 }
-async function load() {
+async function loadOverview() {
   const scope = $("scope").value;
   const d = await IH.cachedFetch("/api/duplicates/report?source=" + encodeURIComponent(scope));
   $("cards").innerHTML = `
@@ -1308,30 +1267,69 @@ async function load() {
     <td><div class="bar"><i style="width:${(100*b.bytes/maxB).toFixed(1)}%"></i></div></td></tr>`).join("");
   const SRCLABEL = {local:"Local", onedrive:"OneDrive", gdrive:"Google Drive", qnap:"QNAP NAS"};
   $("persource").querySelector("tbody").innerHTML = d.per_source.map(s => `
-    <tr class="clickable" onclick="$('scope').value='${s.source}';load()">
+    <tr class="clickable" onclick="$('scope').value='${s.source}';loadOverview()">
       <td>${esc(SRCLABEL[s.source] || s.source)}</td><td class="num">${N(s.files)}</td>
       <td class="num">${N(s.groups)}</td><td class="num">${N(s.copies)}</td>
       <td class="num">${fmtSize(s.reclaim)}</td></tr>`).join("")
       || `<tr><td colspan="5" style="color:var(--muted)">No duplicates.</td></tr>`;
   $("top").querySelector("tbody").innerHTML = d.top.map(t => `
     <tr>
-      <td><a class="glink" href="/duplicates?mode=hash&file_id=${t.id}" title="Show this group in the duplicate checker">${esc(t.name)}</a>
-        <div class="path">${esc(t.path)} <span class="src">&middot; ${esc(t.source)}</span></div></td>
+      <td><a class="glink" onclick="openGroup(${t.id})" title="Show this group in the checker">${esc(t.name)}</a>
+        <div class="path">${esc(t.path)} <span class="src">· ${esc(t.source)}</span></div></td>
       <td class="num">${t.count}×</td><td class="num">${fmtSize(t.each)}</td>
       <td class="num">${fmtSize(t.waste)}</td>
-      <td><button class="reveal-btn" onclick="reveal(${t.id}, this)" title="Open containing folder in Explorer">&#128193; Open</button></td>
+      <td><button class="reveal-btn" onclick="revealPath(${t.id}, this)" title="Open containing folder in Explorer">&#128193; Open</button></td>
     </tr>`).join("") || `<tr><td colspan="5" style="color:var(--muted)">No duplicate groups.</td></tr>`;
-  $("sub").innerHTML = `Exact content-hash duplicates in <b>${d.scope === "all" ? "all sources" : esc(SRCLABEL[d.scope] || d.scope)}</b> ` +
-    `&mdash; ${N(d.hashed)} of ${N(d.files)} files hashed. Every removable copy is byte-identical to a kept original.`;
+  $("ovsub").innerHTML = `Exact content-hash duplicates in <b>${d.scope === "all" ? "all sources" : esc(SRCLABEL[d.scope] || d.scope)}</b> ` +
+    `— ${N(d.hashed)} of ${N(d.files)} files hashed. Every removable copy is byte-identical to a kept original.`;
+  _ovLoaded = true;
 }
-const sp = new URLSearchParams(location.search);
-const _rs = IH.loadState("report") || {};
-if (sp.get("source")) $("scope").value = sp.get("source");
-else if (_rs.scope) $("scope").value = _rs.scope;
-function saveReportState() { IH.saveState("report", {scope: $("scope").value, scrollY: window.scrollY}); }
-$("scope").onchange = () => { saveReportState(); load(); };
-load().then(() => { if (!sp.get("source") && _rs.scrollY) window.scrollTo(0, _rs.scrollY); });
-window.addEventListener("beforeunload", saveReportState);
+// Jump from an Overview group straight into the Checker, anchored on that file.
+function openGroup(id) {
+  fileId = String(id); mode = "hash"; page = 0; batch = false;
+  $("batchToggle").classList.remove("active"); $("batchbar").hidden = true;
+  document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b.dataset.mode === "hash"));
+  showView("checker");
+  load();
+}
+function showView(v) {
+  curView = v;
+  $("view-checker").hidden = (v !== "checker");
+  $("view-overview").hidden = (v !== "overview");
+  document.querySelectorAll(".viewtabs button").forEach(b => b.classList.toggle("active", b.dataset.view === v));
+  if (v === "overview" && !_ovLoaded) loadOverview();
+  saveDupState();
+}
+$("scope").onchange = () => { saveDupState(); loadOverview(); };
+document.querySelectorAll(".viewtabs button").forEach(b => b.onclick = () => showView(b.dataset.view));
+if (params.get("mode")) mode = params.get("mode");
+// Restore the last view (mode, filters, batch toggle, scroll) unless the URL
+// carries an explicit anchor/mode deep-link, which always wins.
+const _hasUrl = params.get("file_id") || params.get("mode");
+const _ds = IH.loadState("dups") || {};
+if (!_hasUrl) {
+  if (_ds.mode) mode = _ds.mode;
+  if (typeof _ds.page === "number") page = _ds.page;
+  if (_ds.batch) batch = true;
+  if (_ds.fileId) fileId = _ds.fileId;
+  if (_ds.fq != null) $("fq").value = _ds.fq;
+  if (_ds.fsource != null) $("fsource").value = _ds.fsource;
+  if (_ds.fsize != null) $("fsize").value = _ds.fsize;
+  if (_ds.fpossible) $("fpossible").checked = true;
+}
+if (_ds.ovscope != null) $("scope").value = _ds.ovscope;
+if (params.get("source")) $("scope").value = params.get("source");
+if (batch) { $("batchToggle").classList.add("active"); $("batchbar").hidden = false; }
+document.querySelectorAll(".tabs button").forEach(b =>
+  b.classList.toggle("active", b.dataset.mode === mode));
+load().then(() => { if (curView === "checker" && !_hasUrl && _ds.scrollY) window.scrollTo(0, _ds.scrollY); });
+loadTrash();
+// Initial tab: ?view=overview, a file_id anchor forces Checker, else the saved view.
+let _initView = "checker";
+if (params.get("view") === "overview") _initView = "overview";
+else if (!_hasUrl && _ds.view) _initView = _ds.view;
+showView(_initView);
+window.addEventListener("beforeunload", saveDupState);
 </script>
 </body>
 </html>
@@ -1447,7 +1445,12 @@ window.IH = (function () {
       }
     } catch (e) {}
     return fetch(url).then(function (r) { return r.json(); }).then(function (v) {
-      try { sessionStorage.setItem(key, JSON.stringify({ t: Date.now(), v: v })); } catch (e) {}
+      try {
+        var rec = JSON.stringify({ t: Date.now(), v: v });
+        // Don't cache huge payloads (e.g. big hash-duplicate result sets) —
+        // they blow the sessionStorage quota and slow every read.
+        if (rec.length < 1000000) sessionStorage.setItem(key, rec);
+      } catch (e) {}
       return v;
     });
   }
@@ -1954,7 +1957,7 @@ def api_duplicates(params):
         return {
             "groups": [{
                 "key": key_val, "label": label, "count": len(files),
-                "files": [_file_brief(r) for r in files],
+                "files": [_file_brief(r) for r in files[:GROUP_FILE_CAP]],
             }],
             "total_groups": 1,
             "page": 0,
@@ -1993,11 +1996,14 @@ def api_duplicates(params):
                 f"SELECT * FROM files WHERE {key_expr} = ?{frag} ORDER BY source, name",
                 [key_val] + frag_args).fetchall()
             label = key_val
+        # Cap files per group in the payload: a few hash groups can hold
+        # thousands of identical files, which bloats the response and freezes
+        # the browser. "count" stays the true total; the UI shows "+N more".
         groups.append({
             "key": key_val,
             "label": label,
             "count": len(rows),
-            "files": [_file_brief(r) for r in rows],
+            "files": [_file_brief(r) for r in rows[:GROUP_FILE_CAP]],
         })
     conn.close()
     return {
@@ -2178,7 +2184,9 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/duplicates":
             self._send(200, render_page(DUPS_HTML), "text/html; charset=utf-8")
         elif url.path == "/duplicates/report":
-            self._send(200, render_page(DUP_REPORT_HTML), "text/html; charset=utf-8")
+            # The report is now the Overview tab of /duplicates; keep old
+            # bookmarks and deep-links working.
+            self._redirect("/duplicates?view=overview")
         elif url.path == "/api/duplicates/report":
             self._json(api_duplicates_report(parse_qs(url.query)))
         elif url.path == "/api/stats":
@@ -2348,6 +2356,12 @@ class Handler(BaseHTTPRequestHandler):
             proc.terminate()
 
     # -- helpers -----------------------------------------------------------------
+
+    def _redirect(self, location, code=301):
+        self.send_response(code)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _json(self, obj):
         self._send(200, json.dumps(obj).encode(), "application/json", set_cookie=True)
