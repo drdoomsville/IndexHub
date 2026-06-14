@@ -2329,6 +2329,58 @@ def api_reveal(body):
     return {"ok": True, "path": target}
 
 
+ORGANIZE_SOURCES = ("local", "onedrive", "gdrive")  # QNAP deferred
+
+
+def api_organize_preview(params):
+    source = (params.get("source", [""])[0] or "").strip()
+    if source not in ORGANIZE_SOURCES:
+        return {"ok": False, "error": "Choose a drive"}
+    conn = db()
+    try:
+        return file_ops.organize_plan(conn, source)
+    finally:
+        conn.close()
+
+
+def api_organize_start(body):
+    source = (body.get("source") or "").strip()
+    if source not in ORGANIZE_SOURCES:
+        return {"ok": False, "error": "Choose a drive"}
+    try:
+        batch_id = file_ops.organize_jobs.enqueue_organize(source)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "batch_id": batch_id}
+
+
+def api_organize_status():
+    return file_ops.organize_jobs.status()
+
+
+def api_organize_cancel():
+    return {"ok": file_ops.organize_jobs.cancel()}
+
+
+def api_organize_batches():
+    conn = db()
+    try:
+        return {"ok": True, "batches": file_ops.list_batches(conn)}
+    finally:
+        conn.close()
+
+
+def api_organize_undo(body):
+    batch_id = (body.get("batch_id") or "").strip()
+    if not batch_id:
+        return {"ok": False, "error": "batch_id required"}
+    try:
+        file_ops.organize_jobs.enqueue_undo(batch_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     session_id = ""
@@ -2380,6 +2432,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(api_delete_status())
         elif url.path == "/api/trash":
             self._json(api_trash(self.session_id))
+        elif url.path == "/media-org":
+            self._send(200, render_page(MEDIAORG_HTML), "text/html; charset=utf-8")
+        elif url.path == "/api/organize/preview":
+            self._json(api_organize_preview(parse_qs(url.query)))
+        elif url.path == "/api/organize/status":
+            self._json(api_organize_status())
+        elif url.path == "/api/organize/batches":
+            self._json(api_organize_batches())
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -2401,6 +2461,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if url.path == "/api/delete/cancel":
             self._json(api_delete_cancel())
+            return
+        if url.path == "/api/organize/start":
+            self._json(api_organize_start(body))
+            return
+        if url.path == "/api/organize/cancel":
+            self._json(api_organize_cancel())
+            return
+        if url.path == "/api/organize/undo":
+            self._json(api_organize_undo(body))
             return
         if url.path == "/api/mark-delete":
             try:
