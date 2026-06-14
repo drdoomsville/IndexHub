@@ -1849,7 +1849,9 @@ def api_rename(body):
 # --- duplicates -----------------------------------------------------------------
 
 DUP_MODES = {
-    "name": "LOWER(name)",
+    # "name COLLATE NOCASE" groups case-insensitively like LOWER(name) but can
+    # use the idx_files_name_lower index, where LOWER(name) cannot.
+    "name": "name COLLATE NOCASE",
     "meta": "meta_fingerprint",
     "hash": "content_hash",
 }
