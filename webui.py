@@ -269,7 +269,8 @@ APP_HTML = """<!DOCTYPE html>
   </div>
 </div>
 <div class="trash-bar" id="trashBar" hidden>
-  <h3>Session trash &mdash; restore before closing the browser</h3>
+  <h3>Session trash &mdash; restore before closing the browser
+    <button id="trashEmpty" type="button" style="margin-left:10px;font-size:11px;padding:2px 8px;border-radius:6px;cursor:pointer">Empty trash</button></h3>
   <div id="trashList"></div>
   <button id="trashToggle" type="button" hidden></button>
 </div>
@@ -552,6 +553,14 @@ $("trashList").addEventListener("click", async e => {
   if (res.ok) { IH.bustCache(); loadTrash(); search(); updateFacets(); loadStats(); }
   else alert(res.error || "Restore failed");
 });
+$("trashEmpty").onclick = async () => {
+  if (!confirm("Permanently delete all files in the session trash? This cannot be undone.")) return;
+  const btn = $("trashEmpty"); btn.disabled = true;
+  const res = await (await fetch("/api/trash/empty", {method: "POST"})).json();
+  btn.disabled = false;
+  if (res.errors && res.errors.length) alert("Some items could not be removed: " + res.errors.join("; "));
+  IH.bustCache(); loadTrash();
+};
 $("markDelete").addEventListener("change", async () => {
   if (!sel) return;
   const res = await (await fetch("/api/mark-delete", {
@@ -1095,7 +1104,8 @@ DUPS_HTML = """<!DOCTYPE html>
   </div>
 </div>
 <div class="trash-bar" id="trashBar" hidden>
-  <h3>Session trash &mdash; restore before closing the browser</h3>
+  <h3>Session trash &mdash; restore before closing the browser
+    <button id="trashEmpty" type="button" style="margin-left:10px;font-size:11px;padding:2px 8px;border-radius:6px;cursor:pointer">Empty trash</button></h3>
   <div id="trashList"></div>
   <button id="trashToggle" type="button" hidden></button>
 </div>
@@ -1312,6 +1322,14 @@ $("trashList").addEventListener("click", async e => {
   if (res.ok) { IH.bustCache(); loadTrash(); load(); }
   else { alert(res.error || "Restore failed"); b.disabled = false; }
 });
+$("trashEmpty").onclick = async () => {
+  if (!confirm("Permanently delete all files in the session trash? This cannot be undone.")) return;
+  const btn = $("trashEmpty"); btn.disabled = true;
+  const res = await (await fetch("/api/trash/empty", {method: "POST"})).json();
+  btn.disabled = false;
+  if (res.errors && res.errors.length) alert("Some items could not be removed: " + res.errors.join("; "));
+  IH.bustCache(); loadTrash();
+};
 let ft;
 $("fq").addEventListener("input", () => { clearTimeout(ft); ft = setTimeout(() => { page = 0; load(); }, 300); });
 ["fsource", "fsize", "fpossible"].forEach(id =>
@@ -2355,6 +2373,10 @@ def api_trash(session_id: str):
     return {"items": items}
 
 
+def api_trash_empty(session_id: str):
+    return file_ops.file_sessions.empty_trash(session_id)
+
+
 def api_mark_delete(body, session_id: str):
     conn = db()
     try:
@@ -2663,6 +2685,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_restore_file(body, self.session_id))
             except ValueError as exc:
                 self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/trash/empty":
+            self._json(api_trash_empty(self.session_id))
             return
         if url.path == "/api/move":
             try:

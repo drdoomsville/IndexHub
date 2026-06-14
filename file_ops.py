@@ -204,6 +204,47 @@ class FileSessionManager:
         with self._lock:
             return list(self._trash.get(session_id, []))
 
+    def empty_trash(self, session_id: str) -> dict:
+        """Permanently delete every trashed file for this session and clear the
+        restore list. Irreversible — the index rows are already gone, so this
+        only frees the disk/remote space the trash bin was holding."""
+        with self._lock:
+            entries = self._trash.get(session_id, [])
+            self._trash[session_id] = []   # we own these files now; drop them
+        removed, errors = 0, []
+        remote_sources = set()
+        for entry in entries:
+            source = entry["source"]
+            if source in ("local", "onedrive"):
+                try:
+                    tp = entry["trash_path"]
+                    if exists_on_disk(tp):
+                        os.remove(long_path(tp))
+                    removed += 1
+                except OSError as exc:
+                    errors.append(f"{entry.get('name', '?')}: {exc}")
+            else:
+                # Remote entries are purged per-source in one shot below.
+                remote_sources.add(source)
+                removed += 1
+        # Best-effort: drop the now-empty local session trash tree.
+        shutil.rmtree(TRASH_ROOT / session_id, ignore_errors=True)
+        # Purge each remote's per-session trash folder in a single rclone call.
+        for source in remote_sources:
+            try:
+                proc = subprocess.run(
+                    [mi.find_rclone(), "purge",
+                     mi.rclone_full_path(source, f".indexhub-trash/{session_id}")],
+                    capture_output=True, text=True, encoding="utf-8")
+                low = proc.stderr.lower()
+                if proc.returncode != 0 and not (
+                        "not found" in low or "doesn't exist" in low
+                        or "does not exist" in low or "no such" in low):
+                    errors.append(f"{source}: {proc.stderr.strip()[:200]}")
+            except OSError as exc:
+                errors.append(f"{source}: {exc}")
+        return {"ok": True, "removed": removed, "errors": errors}
+
     def _add_entry(self, session_id: str, entry: dict):
         with self._lock:
             self._trash.setdefault(session_id, []).append(entry)
