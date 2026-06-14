@@ -794,6 +794,7 @@ LANDING_HTML = """<!DOCTYPE html>
     <div class="scan-row">
       <button class="primary" id="scanStart">Start scan</button>
       <button id="scanCancel" disabled>Cancel</button>
+      <button id="pruneMissing" type="button" title="Remove index entries for local / OneDrive files no longer on disk">Prune missing files</button>
     </div>
     <div id="scanStatus">Idle</div>
   </div>
@@ -868,6 +869,29 @@ document.getElementById("scanStart").onclick = async () => {
 document.getElementById("scanCancel").onclick = async () => {
   await fetch("/api/scan/cancel", {method: "POST"});
   refreshScanStatus();
+};
+document.getElementById("pruneMissing").onclick = async () => {
+  if (!confirm("Remove index entries for local / OneDrive files that no longer exist on disk?\n\nRemote files (QNAP, Google Drive) are not checked.")) return;
+  const btn = document.getElementById("pruneMissing");
+  const status = document.getElementById("scanStatus");
+  btn.disabled = true;
+  status.className = "running";
+  status.textContent = "Checking files on disk…";
+  try {
+    const res = await (await fetch("/api/prune-missing", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: "{}",
+    })).json();
+    if (res.ok) {
+      IH.bustCache();
+      status.textContent = `Pruned ${res.pruned.toLocaleString()} missing file(s) of ${res.checked.toLocaleString()} checked.`;
+    } else {
+      status.textContent = res.error || "Prune failed";
+    }
+  } catch (e) {
+    status.textContent = "Prune failed: " + e;
+  }
+  status.className = "";
+  btn.disabled = false;
 };
 refreshScanStatus();
 </script>
@@ -1072,7 +1096,7 @@ const $ = id => document.getElementById(id);
 const esc = s => (s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const params = new URLSearchParams(location.search);
 let mode = "name", page = 0, fileId = params.get("file_id") || "";
-let batch = false, lastGroups = [], curView = "checker";
+let batch = false, lastGroups = [], curView = "checker", fromOverview = false;
 function fmtSize(n) {
   if (n == null || n < 0) return "";
   const u = ["B","KB","MB","GB","TB"]; let i = 0;
@@ -1126,6 +1150,15 @@ async function load() {
   $("next").disabled = page >= pages - 1;
   updateSelInfo();
   saveDupState();
+  // If we drilled in from the Overview and just cleared the last copies of
+  // this group, hop back to the Overview and refresh its numbers.
+  if (fromOverview && fileId && d.groups.length === 0) {
+    fromOverview = false;
+    fileId = "";
+    IH.bustCache();
+    showView("overview");
+    loadOverview();
+  }
 }
 function saveDupState() {
   IH.saveState("dups", {
@@ -1281,6 +1314,7 @@ document.querySelectorAll(".tabs button").forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll(".tabs button").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
+    fromOverview = false;
     mode = btn.dataset.mode;
     page = 0;
     load();
@@ -1332,6 +1366,7 @@ async function loadOverview() {
 }
 // Jump from an Overview group straight into the Checker, anchored on that file.
 function openGroup(id) {
+  fromOverview = true;  // so we can return to Overview once this group is cleared
   fileId = String(id); mode = "hash"; page = 0; batch = false;
   $("batchToggle").classList.remove("active"); $("batchbar").hidden = true;
   document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b.dataset.mode === "hash"));
@@ -1347,7 +1382,7 @@ function showView(v) {
   saveDupState();
 }
 $("scope").onchange = () => { saveDupState(); loadOverview(); };
-document.querySelectorAll(".viewtabs button").forEach(b => b.onclick = () => showView(b.dataset.view));
+document.querySelectorAll(".viewtabs button").forEach(b => b.onclick = () => { fromOverview = false; showView(b.dataset.view); });
 if (params.get("mode")) mode = params.get("mode");
 // Restore the last view (mode, filters, batch toggle, scroll) unless the URL
 // carries an explicit anchor/mode deep-link, which always wins.
@@ -2138,6 +2173,29 @@ def api_delete_batch(body, session_id: str):
             "failed": failed, "requested": len(ids)}
 
 
+def api_prune_missing():
+    """Remove index rows for local/OneDrive files that no longer exist on disk.
+
+    Only filesystem-backed sources are swept — checking remote sources (QNAP,
+    Google Drive) would mean one rclone call per file. The rows point at files
+    that are already gone, so they're hard-deleted (no trash)."""
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT id, path FROM files WHERE source IN ('local', 'onedrive')"
+        ).fetchall()
+        gone = [r["id"] for r in rows if not Path(r["path"]).is_file()]
+        for i in range(0, len(gone), 500):
+            chunk = gone[i:i + 500]
+            conn.execute(
+                f"DELETE FROM files WHERE id IN ({','.join('?' * len(chunk))})", chunk)
+        if gone:
+            conn.commit()
+        return {"ok": True, "pruned": len(gone), "checked": len(rows)}
+    finally:
+        conn.close()
+
+
 def api_ingest(body, token_ok: bool):
     """Accept a remote machine's local-file inventory and upsert it into the
     shared index, tagged with that machine's identity. Used by `media_index.py
@@ -2314,6 +2372,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_reveal(body))
             except Exception as exc:
                 self._json({"ok": False, "error": f"Open folder failed: {exc}"})
+            return
+        if url.path == "/api/prune-missing":
+            try:
+                self._json(api_prune_missing())
+            except Exception as exc:
+                self._json({"ok": False, "error": f"Prune failed: {exc}"})
             return
         if url.path not in ("/api/rename", "/api/reclassify"):
             self._send(404, b"not found", "text/plain")
