@@ -64,6 +64,122 @@ def is_cloud_placeholder(path: str) -> bool:
     return bool(attrs & _CLOUD_ONLY_ATTRS)
 
 
+# media-org bucket per index `kind`. Files of other kinds are not moved.
+ORGANIZE_BUCKETS = {"video": "Video", "audio": "Audio",
+                    "image": "Images", "document": "Documents"}
+
+
+def _is_remote(source: str) -> bool:
+    return source == "gdrive"
+
+
+def source_root(source: str) -> str:
+    """Root under which media-org/ is created. local/onedrive -> absolute path;
+    gdrive -> '' (the remote root). QNAP is deferred."""
+    if source == "local":
+        return str(mi.USER)
+    if source == "onedrive":
+        return str(mi.ONEDRIVE_ROOT)
+    if source == "gdrive":
+        return ""
+    raise ValueError(f"Media Org is not available for source: {source}")
+
+
+def _media_org_root(source: str) -> str:
+    if _is_remote(source):
+        return "media-org"
+    return os.path.join(source_root(source), "media-org")
+
+
+def _already_sorted(source: str, path: str) -> bool:
+    base = _media_org_root(source)
+    if _is_remote(source):
+        return path.replace("\\", "/").lstrip("/").startswith(base + "/")
+    return os.path.normcase(os.path.abspath(path)).startswith(
+        os.path.normcase(os.path.abspath(base)) + os.sep)
+
+
+def _dest_path(source: str, bucket: str, name: str) -> str:
+    if _is_remote(source):
+        return f"media-org/{bucket}/{name}"
+    return os.path.join(_media_org_root(source), bucket, name)
+
+
+def _dest_exists(source: str, dest: str) -> bool:
+    if _is_remote(source):
+        proc = subprocess.run(
+            [mi.find_rclone(), "lsf", mi.rclone_full_path(source, dest)],
+            capture_output=True, text=True, encoding="utf-8")
+        return proc.returncode == 0 and bool(proc.stdout.strip())
+    return exists_on_disk(dest)
+
+
+def _split_ext(source: str, dest: str):
+    if _is_remote(source):
+        dot = dest.rfind(".")
+        return (dest[:dot], dest[dot:]) if dot > dest.rfind("/") else (dest, "")
+    return os.path.splitext(dest)
+
+
+def _uniquify(source: str, dest: str) -> str:
+    """Append ' (1)', ' (2)', ... before the extension if dest is taken.
+    The single worker moves files one at a time, so each move lands before the
+    next check — sequential existence checks also resolve same-run collisions."""
+    if not _dest_exists(source, dest):
+        return dest
+    base, ext = _split_ext(source, dest)
+    n = 1
+    while _dest_exists(source, f"{base} ({n}){ext}"):
+        n += 1
+    return f"{base} ({n}){ext}"
+
+
+def _move_path(source: str, src: str, dest: str) -> None:
+    if _is_remote(source):
+        proc = subprocess.run(
+            [mi.find_rclone(), "moveto",
+             mi.rclone_full_path(source, src),
+             mi.rclone_full_path(source, dest)],
+            capture_output=True, text=True, encoding="utf-8")
+        if proc.returncode != 0:
+            raise ValueError(f"Move failed: {proc.stderr.strip()[:300]}")
+        return
+    os.makedirs(long_path(os.path.dirname(dest)), exist_ok=True)
+    shutil.move(long_path(src), long_path(dest))
+
+
+def _base_name(source: str, path: str) -> str:
+    return path.rsplit("/", 1)[-1] if _is_remote(source) else os.path.basename(path)
+
+
+def organize_plan(db: sqlite3.Connection, source: str) -> dict:
+    """Preview: bucket counts for a source. Pure index query, no disk access."""
+    rows = db.execute(
+        "SELECT path, kind FROM files WHERE source = ?", (source,)).fetchall()
+    counts = {"Audio": 0, "Video": 0, "Images": 0, "Documents": 0}
+    skipped = 0
+    for r in rows:
+        bucket = ORGANIZE_BUCKETS.get(r["kind"])
+        if not bucket:
+            continue
+        if _already_sorted(source, r["path"]):
+            skipped += 1
+        else:
+            counts[bucket] += 1
+    return {"ok": True, "source": source, "total": sum(counts.values()),
+            "skipped": skipped, "buckets": counts}
+
+
+def list_batches(db: sqlite3.Connection) -> list:
+    rows = db.execute(
+        "SELECT batch_id, source, COUNT(*) AS total, SUM(undone) AS undone, "
+        "MIN(moved_at) AS started FROM media_org_moves "
+        "GROUP BY batch_id ORDER BY started DESC").fetchall()
+    return [{"batch_id": r["batch_id"], "source": r["source"],
+             "total": r["total"], "undone": r["undone"] or 0,
+             "started": r["started"]} for r in rows]
+
+
 class FileGoneError(Exception):
     """The file is already gone from disk, so there's nothing to trash —
     the stale index row should just be pruned."""
