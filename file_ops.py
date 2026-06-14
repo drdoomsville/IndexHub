@@ -42,6 +42,28 @@ def exists_on_disk(path: str) -> bool:
     return False
 
 
+# Windows attributes set on OneDrive "Files On-Demand" cloud-only placeholders.
+_FILE_ATTRIBUTE_OFFLINE = 0x1000
+_FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+_CLOUD_ONLY_ATTRS = (_FILE_ATTRIBUTE_OFFLINE
+                     | _FILE_ATTRIBUTE_RECALL_ON_OPEN
+                     | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+
+
+def is_cloud_placeholder(path: str) -> bool:
+    """True if the path is a OneDrive Files-On-Demand cloud-only placeholder —
+    it exists in the namespace but isn't downloaded locally. These must never
+    be pruned. Stats the entry itself (no symlink follow) so it isn't recalled."""
+    if os.name != "nt":
+        return False
+    try:
+        attrs = os.stat(long_path(path), follow_symlinks=False).st_file_attributes
+    except OSError:
+        return False
+    return bool(attrs & _CLOUD_ONLY_ATTRS)
+
+
 class FileGoneError(Exception):
     """The file is already gone from disk, so there's nothing to trash —
     the stale index row should just be pruned."""

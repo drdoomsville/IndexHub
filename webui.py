@@ -2195,8 +2195,11 @@ def api_prune_missing():
         rows = conn.execute(
             "SELECT id, path FROM files WHERE source IN ('local', 'onedrive')"
         ).fetchall()
+        # Prune only files truly gone from disk — never OneDrive cloud-only
+        # placeholders (present in the namespace but not downloaded locally).
         gone = [r["id"] for r in rows
-                if not file_ops.exists_on_disk(r["path"])]
+                if not file_ops.exists_on_disk(r["path"])
+                and not file_ops.is_cloud_placeholder(r["path"])]
         for i in range(0, len(gone), 500):
             chunk = gone[i:i + 500]
             conn.execute(
