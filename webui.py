@@ -1477,6 +1477,7 @@ MEDIAORG_HTML = """<!doctype html>
     </div>
     <div id="preview"></div>
     <div id="progress"></div>
+    <button id="cancelBtn" style="display:none;margin-top:8px">Cancel</button>
   </div>
 
   <div class="panel">
@@ -1527,6 +1528,10 @@ document.getElementById('organizeBtn').onclick = function () {
     startPolling();
   });
 };
+document.getElementById('cancelBtn').onclick = function () {
+  this.disabled = true;
+  fetch('/api/organize/cancel', { method:'POST' }).catch(function () {});
+};
 function startPolling() {
   if (poll) return;
   poll = setInterval(tick, 1000); tick();
@@ -1534,12 +1539,17 @@ function startPolling() {
 function tick() {
   fetch('/api/organize/status').then(function (r) { return r.json(); }).then(function (s) {
     var done = (s.moved || 0) + (s.skipped || 0) + (s.failed || 0);
+    var cancelBtn = document.getElementById('cancelBtn');
     if (s.running) {
+      cancelBtn.style.display = 'inline-block';
+      if (!s.cancelled) cancelBtn.disabled = false;
       var verb = s.mode === 'undo' ? 'Undoing' : 'Organizing';
       setProgress((s.cancelled ? 'Cancelling… ' : verb + ' ') + done + ' of ' + (s.total || 0) +
         (s.current ? ' — ' + s.current : '') + (s.failed ? '  (' + s.failed + ' failed)' : ''), true);
     } else {
       if (poll) { clearInterval(poll); poll = null; }
+      cancelBtn.style.display = 'none';
+      cancelBtn.disabled = false;
       if (done > 0 || s.finished_at) {
         setProgress('Done — ' + (s.moved || 0) + ' moved, ' + (s.skipped || 0) +
           ' skipped' + (s.failed ? ', ' + s.failed + ' failed' : '') + '.', false);

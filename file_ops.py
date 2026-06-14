@@ -513,7 +513,7 @@ class OrganizeJobManager:
             return True
 
     def enqueue_organize(self, source: str) -> str:
-        batch_id = f"{source}-{_now()}"
+        batch_id = f"{source}-{_now()}-{uuid.uuid4().hex[:8]}"
         with self._lock:
             if self._state["running"]:
                 raise ValueError("A Media Org job is already running")
@@ -587,15 +587,25 @@ class OrganizeJobManager:
                     _move_path(source, src, dest)
                     name = _base_name(source, dest)
                     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-                    # Record the move first so undo always has the new_path,
-                    # then point the index at the new location.
-                    mi._write_with_retry(db,
-                        "INSERT INTO media_org_moves (batch_id, source, file_id, "
-                        "original_path, new_path, moved_at, undone) VALUES (?,?,?,?,?,?,0)",
-                        (batch_id, source, str(r["id"]), src, dest, _now()))
-                    mi._write_with_retry(db,
-                        "UPDATE files SET path=?, name=?, ext=? WHERE id=?",
-                        (dest, name, ext, r["id"]))
+                    # Record the move first so undo always has the new_path, then
+                    # point the index at the new location. If the log write can't
+                    # land (db locked past every retry) the move would be
+                    # unrecoverable — so put the file back and count it as failed.
+                    if not mi._write_with_retry(db,
+                            "INSERT INTO media_org_moves (batch_id, source, file_id, "
+                            "original_path, new_path, moved_at, undone) VALUES (?,?,?,?,?,?,0)",
+                            (batch_id, source, str(r["id"]), src, dest, _now())):
+                        try:
+                            _move_path(source, dest, src)
+                            self._err(f"{r['name']}: could not record move (db locked); left in place")
+                        except Exception as exc:
+                            self._err(f"{r['name']}: move not recorded and revert failed: {exc}")
+                        continue
+                    if not mi._write_with_retry(db,
+                            "UPDATE files SET path=?, name=?, ext=? WHERE id=?",
+                            (dest, name, ext, r["id"])):
+                        self._err(f"{r['name']}: moved and logged, but index update failed (db locked)")
+                        continue
                     self._inc("moved")
                 except Exception as exc:
                     self._err(f"{r['name']}: {exc}")
@@ -629,8 +639,10 @@ class OrganizeJobManager:
                     mi._write_with_retry(db,
                         "UPDATE files SET path=?, name=?, ext=? WHERE id=?",
                         (r["original_path"], name, ext, int(r["file_id"])))
-                    mi._write_with_retry(db,
-                        "UPDATE media_org_moves SET undone=1 WHERE id=?", (r["id"],))
+                    if not mi._write_with_retry(db,
+                            "UPDATE media_org_moves SET undone=1 WHERE id=?", (r["id"],)):
+                        self._err(f"undo {r['new_path']}: restored but undo-flag not saved (db locked)")
+                        continue
                     self._inc("moved")
                 except Exception as exc:
                     self._err(f"undo {r['new_path']}: {exc}")
