@@ -607,19 +607,16 @@ $("moveBtn").onclick = async () => {
 $("deleteBtn").onclick = async () => {
   if (!sel) return;
   if (!confirm(`Delete "${sel.name}"?\n\nYou can restore it from Session trash until you close the browser.`)) return;
-  $("opsmsg").textContent = "Deleting\u2026";
+  $("opsmsg").textContent = "Queued for deletion\u2026";
   $("opsmsg").className = "opsmsg";
   const res = await (await fetch("/api/delete", {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({id: sel.id}),
   })).json();
   if (res.ok) {
-    IH.bustCache();
     closePanel();
-    loadTrash();
-    search();
-    updateFacets();
-    loadStats();
+    IH.onDeleteComplete(() => { loadTrash(); search(); updateFacets(); loadStats(); });
+    IH.pollDeletes();
   } else {
     $("opsmsg").textContent = res.error || "Delete failed";
     $("opsmsg").className = "opsmsg err";
@@ -1217,12 +1214,12 @@ async function deleteSelected() {
   })).json();
   $("delSel").textContent = "Delete selected";
   if (res.ok) {
-    const _notes = [];
-    if (res.pruned) _notes.push(`${res.pruned} were already gone \u2014 removed from the index`);
-    if (res.failed && res.failed.length)
-      _notes.push(`${res.failed.length} failed:\\n` + res.failed.slice(0, 6).map(f => "\u2022 " + f.error).join("\\n"));
-    if (_notes.length) alert(`Deleted ${res.deleted} of ${res.requested}.\\n` + _notes.join("\\n"));
-    IH.bustCache(); loadTrash(); load();
+    $("delSel").disabled = false;
+    IH.onDeleteComplete((s) => {
+      if (s && s.failed) alert(`${s.failed} delete(s) failed:\\n` + (s.errors || []).slice(0, 6).join("\\n"));
+      loadTrash(); load();
+    });
+    IH.pollDeletes();
   } else { alert(res.error || "Batch delete failed"); $("delSel").disabled = false; }
 }
 $("batchToggle").onclick = () => {
@@ -1261,7 +1258,7 @@ $("groups").addEventListener("click", async e => {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({id: +del.dataset.del}),
     })).json();
-    if (res.ok) { IH.bustCache(); loadTrash(); load(); }
+    if (res.ok) { IH.onDeleteComplete(() => { loadTrash(); load(); }); IH.pollDeletes(); }
     else { alert(res.error || "Delete failed"); del.disabled = false; del.textContent = "Delete"; }
   }
 });
@@ -1563,16 +1560,53 @@ window.IH = (function () {
     try { var r = sessionStorage.getItem(STATE + key); return r ? JSON.parse(r) : null; }
     catch (e) { return null; }
   }
+  // ---- background delete progress ----
+  var _delTimer = null, _onDone = null;
+  function onDeleteComplete(fn) { _onDone = fn; }
+  function pollDeletes() {
+    if (_delTimer) return;
+    _delTimer = setInterval(_tickDeletes, 1000);
+    _tickDeletes();
+  }
+  function _tickDeletes() {
+    fetch("/api/delete/status").then(function (r) { return r.json(); }).then(function (s) {
+      var bar = document.getElementById("ih-delbar");
+      var processed = (s.deleted || 0) + (s.pruned || 0) + (s.failed || 0);
+      if (s.running) {
+        if (bar) {
+          bar.hidden = false;
+          bar.textContent = "Deleting " + processed + " of " + (s.total || 0)
+            + (s.current ? " \\u2014 " + s.current : "")
+            + (s.failed ? "  (" + s.failed + " failed)" : "");
+        }
+      } else {
+        if (_delTimer) { clearInterval(_delTimer); _delTimer = null; }
+        if (bar) bar.hidden = true;
+        bustCache();
+        var cb = _onDone; _onDone = null;
+        if (cb) cb(s);
+      }
+    }).catch(function () {});
+  }
   return { cachedFetch: cachedFetch, bustCache: bustCache,
-           saveState: saveState, loadState: loadState };
+           saveState: saveState, loadState: loadState,
+           pollDeletes: pollDeletes, onDeleteComplete: onDeleteComplete };
 })();
 """
 
 
+_DELBAR = (
+    '<div id="ih-delbar" hidden style="position:fixed;top:0;left:0;right:0;'
+    "z-index:50;background:#3a2330;color:#ffb3c1;border-bottom:1px solid #5a3344;"
+    'padding:8px 16px;font-size:13px;text-align:center;font-weight:600"></div>'
+)
+
+
 def render_page(html: str) -> bytes:
-    """Inject the shared IH helper into <head> and the footer before </body>."""
+    """Inject the shared IH helper into <head>, the delete-progress bar and the
+    footer before </body>."""
     html = html.replace("</head>", f"<script>{COMMON_JS}</script>\n</head>", 1)
-    html = html.replace("</body>", footer_html() + "\n</body>", 1)
+    html = html.replace("</body>", _DELBAR + footer_html() + "\n</body>", 1)
     return html.encode()
 
 
@@ -2153,37 +2187,28 @@ def api_mark_delete(body, session_id: str):
 
 
 def api_delete_file(body, session_id: str):
-    conn = db()
-    try:
-        return file_ops.file_sessions.delete_file(conn, session_id, str(body.get("id")))
-    finally:
-        conn.close()
+    """Queue a single delete on the background worker; returns immediately."""
+    fid = body.get("id")
+    if fid is None:
+        return {"ok": False, "error": "No file id"}
+    file_ops.delete_jobs.enqueue(session_id, [fid])
+    return {"ok": True, "queued": 1}
 
 
 def api_delete_batch(body, session_id: str):
-    """Delete many files to session trash in one call. Each file is handled
-    independently; a failure on one doesn't abort the rest."""
+    """Queue many deletes on the background worker; returns immediately. The UI
+    polls /api/delete/status for progress."""
     ids = body.get("ids")
     if not isinstance(ids, list) or not ids:
         return {"ok": False, "error": "No files selected"}
     if len(ids) > 5000:
         return {"ok": False, "error": "Too many files in one batch (max 5000)"}
-    conn = db()
-    deleted, pruned, failed = [], 0, []
-    try:
-        for fid in ids:
-            try:
-                res = file_ops.file_sessions.delete_file(conn, session_id, str(fid))
-                if res.get("pruned"):
-                    pruned += 1  # file was already gone; stale row removed
-                else:
-                    deleted.append(res["entry"]["entry_id"])
-            except Exception as exc:
-                failed.append({"id": fid, "error": str(exc)})
-    finally:
-        conn.close()
-    return {"ok": True, "deleted": len(deleted), "pruned": pruned,
-            "failed": failed, "requested": len(ids)}
+    file_ops.delete_jobs.enqueue(session_id, ids)
+    return {"ok": True, "queued": len(ids)}
+
+
+def api_delete_status():
+    return file_ops.delete_jobs.status()
 
 
 def api_prune_missing():
@@ -2325,6 +2350,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(api_duplicates_summary())
         elif url.path == "/api/scan/status":
             self._json(api_scan_status())
+        elif url.path == "/api/delete/status":
+            self._json(api_delete_status())
         elif url.path == "/api/trash":
             self._json(api_trash(self.session_id))
         else:

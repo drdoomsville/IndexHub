@@ -118,19 +118,19 @@ class FileSessionManager:
         # Delete the index row first (uncommitted), move the file second:
         # if the move fails we roll back and nothing changed; the move is the
         # step that can't be rolled back, so it must come last.
-        db.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        # Move the file to trash BEFORE touching the DB: a remote (rclone) move
+        # can take minutes, and holding a write lock across it starves other
+        # writers (the hash pass, other deletes) into "database is locked".
         try:
             trash_path = self._move_to_trash(session_id, entry_id, row)
         except FileGoneError:
-            # The file is already gone from disk — keep the DELETE (prune the
-            # stale index row) instead of rolling back. Nothing to restore, so
-            # no trash entry is created.
+            # Already gone from disk — just prune the stale index row.
+            db.execute("DELETE FROM files WHERE id = ?", (file_id,))
             db.commit()
             return {"ok": True, "pruned": True, "name": row["name"],
                     "source": row["source"], "original_path": row["path"]}
-        except BaseException:
-            db.rollback()
-            raise
+        # File is safely in trash; now remove the index row (a brief write).
+        db.execute("DELETE FROM files WHERE id = ?", (file_id,))
         db.commit()
         entry = {
             "entry_id": entry_id,
@@ -283,6 +283,78 @@ class FileSessionManager:
 
 
 file_sessions = FileSessionManager()
+
+
+class DeleteJobManager:
+    """Runs file deletions on a single background worker so the UI returns
+    immediately and a slow remote (rclone) move doesn't block the request.
+    A status snapshot drives the progress bar in the web UI."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._queue: list[tuple[str, str]] = []   # (session_id, file_id)
+        self._thread: threading.Thread | None = None
+        self._state = self._idle()
+
+    @staticmethod
+    def _idle() -> dict:
+        return {"running": False, "total": 0, "deleted": 0, "pruned": 0,
+                "failed": 0, "current": "", "started_at": None,
+                "finished_at": None, "errors": []}
+
+    def status(self) -> dict:
+        with self._lock:
+            s = dict(self._state)
+            s["queued"] = len(self._queue)
+            return s
+
+    def enqueue(self, session_id: str, ids: list) -> int:
+        ids = [str(i) for i in ids]
+        with self._lock:
+            if not self._state["running"]:
+                # Fresh batch: reset the counters so the bar starts at 0.
+                self._state = self._idle()
+                self._state.update(running=True, total=len(ids), started_at=_now())
+                self._queue = [(session_id, i) for i in ids]
+                self._thread = threading.Thread(target=self._run, daemon=True)
+                self._thread.start()
+            else:
+                self._queue.extend((session_id, i) for i in ids)
+                self._state["total"] += len(ids)
+            return self._state["total"]
+
+    def _run(self):
+        db = mi.get_db()
+        db.row_factory = sqlite3.Row  # delete_file reads rows by column name
+        try:
+            while True:
+                with self._lock:
+                    if not self._queue:
+                        break
+                    session_id, fid = self._queue.pop(0)
+                try:
+                    res = file_sessions.delete_file(db, session_id, fid)
+                    name = res.get("name") or res.get("entry", {}).get("name", "")
+                    with self._lock:
+                        if res.get("pruned"):
+                            self._state["pruned"] += 1
+                        else:
+                            self._state["deleted"] += 1
+                        self._state["current"] = name
+                except Exception as exc:
+                    with self._lock:
+                        self._state["failed"] += 1
+                        if len(self._state["errors"]) < 20:
+                            self._state["errors"].append(str(exc))
+        finally:
+            db.close()
+            with self._lock:
+                self._state["running"] = False
+                self._state["current"] = ""
+                self._state["finished_at"] = _now()
+
+
+delete_jobs = DeleteJobManager()
 
 
 def parse_session_id(cookie_header: str | None) -> tuple[str, bool]:

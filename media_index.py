@@ -880,6 +880,30 @@ def flag_possible_dupes(db: sqlite3.Connection) -> int:
     return cur.rowcount
 
 
+def _write_with_retry(db: sqlite3.Connection, sql: str, params, attempts: int = 6) -> bool:
+    """Execute + commit a write, retrying transient 'database is locked' errors.
+
+    Each attempt already waits out the busy timeout, so this tolerates a lock
+    held for minutes (e.g. another writer mid remote move) without letting a
+    single failure abort a long-running pass. Returns False if still locked
+    after all attempts so the caller can skip that row and carry on."""
+    for attempt in range(attempts):
+        try:
+            db.execute(sql, params)
+            db.commit()
+            return True
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            try:
+                db.rollback()
+            except sqlite3.Error:
+                pass
+            if attempt < attempts - 1:
+                time.sleep(min(2 ** attempt, 15))
+    return False
+
+
 def run_hash_pass(db: sqlite3.Connection, sources: list[str] | None = None,
                   path_prefix: str = "", missing_only: bool = True,
                   cancel_event=None, progress_cb=None) -> int:
@@ -914,9 +938,12 @@ def run_hash_pass(db: sqlite3.Connection, sources: list[str] | None = None,
             continue
         # Commit per file: hashing can take seconds (remote downloads), and
         # holding a write transaction across iterations starves other
-        # connections (UI deletes/renames) into "database is locked".
-        db.execute("UPDATE files SET content_hash = ? WHERE id = ?", (digest, row_id))
-        db.commit()
+        # connections (UI deletes/renames) into "database is locked". Retry a
+        # transient lock instead of aborting the whole pass; skip on giving up.
+        if not _write_with_retry(
+                db, "UPDATE files SET content_hash = ? WHERE id = ?", (digest, row_id)):
+            print(f"  [hash] skipped id={row_id}: database stayed locked", flush=True)
+            continue
         done += 1
         if done % 100 == 0:
             msg = f"  [hash] {done:,}/{len(rows):,} files hashed..."
