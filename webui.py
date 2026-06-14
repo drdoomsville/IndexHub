@@ -1072,13 +1072,13 @@ DUPS_HTML = """<!DOCTYPE html>
       </select>
     </div>
     <div class="cards" id="cards"></div>
-    <h2 class="collapsible" data-target="buckets">Reclaimable space by file size</h2>
-    <table id="buckets"><thead><tr>
+    <h2 class="collapsible collapsed" data-target="buckets">Reclaimable space by file size</h2>
+    <table id="buckets" style="display:none"><thead><tr>
       <th>Per-file size</th><th class="num">Groups</th><th class="num">Removable copies</th>
       <th class="num">Reclaimable</th><th style="width:30%">Share</th>
     </tr></thead><tbody></tbody></table>
-    <h2 class="collapsible" data-target="persource">By source</h2>
-    <table id="persource"><thead><tr>
+    <h2 class="collapsible collapsed" data-target="persource">By source</h2>
+    <table id="persource" style="display:none"><thead><tr>
       <th>Source</th><th class="num">Hashed files</th><th class="num">Dup groups</th>
       <th class="num">Removable copies</th><th class="num">Reclaimable</th>
     </tr></thead><tbody></tbody></table>
