@@ -35,6 +35,7 @@ LOCAL_ROOTS = [
     USER / "Downloads",
     USER / "Documents",
     USER / "Desktop",
+    USER / "media-org",
 ]
 GDRIVE_REMOTE = "gdrive:"
 QNAP_CONFIG_PATH = Path(__file__).parent / "qnap_config.json"
@@ -559,6 +560,17 @@ CREATE TABLE IF NOT EXISTS scans (
     file_count INTEGER,
     total_bytes INTEGER
 );
+CREATE TABLE IF NOT EXISTS media_org_moves (
+    id            INTEGER PRIMARY KEY,
+    batch_id      TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    file_id       TEXT NOT NULL,
+    original_path TEXT NOT NULL,
+    new_path      TEXT NOT NULL,
+    moved_at      TEXT NOT NULL,
+    undone        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_org_moves_batch ON media_org_moves (batch_id);
 """
 
 
