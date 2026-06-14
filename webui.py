@@ -747,7 +747,7 @@ LANDING_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="wrap">
-  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/duplicates">Duplicates</a></div>
+  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/media-org">Media Org</a> &middot; <a href="/duplicates">Duplicates</a></div>
   <h1>File <span>Index</span> Hub</h1>
   <div class="sub">Your local, OneDrive, Google Drive, and QNAP NAS files, indexed and searchable.</div>
   <div class="grid">
@@ -770,6 +770,13 @@ LANDING_HTML = """<!DOCTYPE html>
       <h2>Duplicates</h2>
       <div class="desc">Find matches by name, metadata, or content hash &mdash; with the reclaimable-space report</div>
       <div class="stats" id="dup-stats">Loading&hellip;</div>
+      <span class="open">Open &rarr;</span>
+    </a>
+    <a class="bigcard" href="/media-org">
+      <div class="icon">&#128194;</div>
+      <h2>Media Org</h2>
+      <div class="desc">Sort a drive's files into media-org/ buckets &mdash; undoable</div>
+      <div class="stats">Audio &middot; Video &middot; Images &middot; Documents</div>
       <span class="open">Open &rarr;</span>
     </a>
   </div>
@@ -1426,6 +1433,150 @@ window.addEventListener("beforeunload", saveDupState);
 </body>
 </html>
 """
+
+MEDIAORG_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Media Org</title>
+<style>
+  :root { --bg:#15171c; --card:#1e2128; --text:#e8eaed; --muted:#9aa0a6; --accent:#7aa2f7; --line:#2a2e37; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,Segoe UI,Arial; }
+  .wrap { max-width:860px; margin:0 auto; padding:24px 20px 80px; }
+  .topnav { color:var(--muted); font-size:13px; margin-bottom:14px; }
+  .topnav a { color:var(--accent); text-decoration:none; }
+  h1 { font-size:26px; margin:0 0 4px; } h1 span { color:var(--accent); }
+  .sub { color:var(--muted); margin-bottom:20px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; margin-bottom:18px; }
+  label.src { display:block; padding:8px 10px; border:1px solid var(--line); border-radius:8px; margin-bottom:8px; cursor:pointer; }
+  label.src:hover { border-color:var(--accent); }
+  button { background:#272b34; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 16px; font-size:14px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#10131a; font-weight:600; }
+  button:disabled { opacity:.45; cursor:default; }
+  #preview, #progress { color:var(--muted); margin-top:12px; min-height:20px; font-size:14px; }
+  #progress.active { color:var(--text); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; }
+  .err { color:#ff8a8a; }
+</style></head>
+<body>
+<div class="wrap">
+  <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/media">Media</a> &middot; <a href="/documents">Documents</a> &middot; <a href="/duplicates">Duplicates</a></div>
+  <h1>Media <span>Org</span></h1>
+  <div class="sub">Pick a drive, then sort its files into <code>media-org/</code> buckets (Audio, Video, Images, Documents). Every move is remembered so you can undo a whole run.</div>
+
+  <div class="panel">
+    <h3 style="margin-top:0">1. Choose a drive</h3>
+    <label class="src"><input type="radio" name="src" value="local"> Local</label>
+    <label class="src"><input type="radio" name="src" value="onedrive"> OneDrive</label>
+    <label class="src"><input type="radio" name="src" value="gdrive"> Google Drive</label>
+    <div style="margin-top:10px">
+      <button id="previewBtn">Preview</button>
+      <button id="organizeBtn" class="primary" disabled>Organize</button>
+    </div>
+    <div id="preview"></div>
+    <div id="progress"></div>
+  </div>
+
+  <div class="panel">
+    <h3 style="margin-top:0">Past runs</h3>
+    <table id="batches"><thead><tr><th>When</th><th>Drive</th><th>Files</th><th></th></tr></thead><tbody></tbody></table>
+  </div>
+</div>
+<script>
+var lastPreviewSrc = null, poll = null;
+function selectedSrc() {
+  var el = document.querySelector('input[name=src]:checked');
+  return el ? el.value : null;
+}
+function setProgress(s, active) {
+  var el = document.getElementById('progress');
+  el.textContent = s; el.className = active ? 'active' : '';
+}
+document.querySelectorAll('input[name=src]').forEach(function (r) {
+  r.onchange = function () {
+    document.getElementById('organizeBtn').disabled = true;
+    document.getElementById('preview').textContent = '';
+    lastPreviewSrc = null;
+  };
+});
+document.getElementById('previewBtn').onclick = function () {
+  var src = selectedSrc();
+  if (!src) { document.getElementById('preview').textContent = 'Choose a drive first.'; return; }
+  document.getElementById('preview').textContent = 'Previewing…';
+  fetch('/api/organize/preview?source=' + src).then(function (r) { return r.json(); }).then(function (p) {
+    if (!p.ok) { document.getElementById('preview').textContent = p.error || 'Preview failed'; return; }
+    var b = p.buckets;
+    document.getElementById('preview').textContent =
+      p.total + ' files to sort — Audio ' + b.Audio + ', Video ' + b.Video +
+      ', Images ' + b.Images + ', Documents ' + b.Documents +
+      ' (' + p.skipped + ' already sorted, skipped)';
+    lastPreviewSrc = src;
+    document.getElementById('organizeBtn').disabled = (p.total === 0);
+  });
+};
+document.getElementById('organizeBtn').onclick = function () {
+  var src = selectedSrc();
+  if (!src || src !== lastPreviewSrc) { setProgress('Preview this drive first.', false); return; }
+  if (!confirm('Move ' + src + ' files into media-org/ buckets?')) return;
+  document.getElementById('organizeBtn').disabled = true;
+  fetch('/api/organize/start', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ source: src }) }).then(function (r) { return r.json(); }).then(function (res) {
+    if (!res.ok) { setProgress(res.error || 'Could not start', false); return; }
+    startPolling();
+  });
+};
+function startPolling() {
+  if (poll) return;
+  poll = setInterval(tick, 1000); tick();
+}
+function tick() {
+  fetch('/api/organize/status').then(function (r) { return r.json(); }).then(function (s) {
+    var done = (s.moved || 0) + (s.skipped || 0) + (s.failed || 0);
+    if (s.running) {
+      var verb = s.mode === 'undo' ? 'Undoing' : 'Organizing';
+      setProgress((s.cancelled ? 'Cancelling… ' : verb + ' ') + done + ' of ' + (s.total || 0) +
+        (s.current ? ' — ' + s.current : '') + (s.failed ? '  (' + s.failed + ' failed)' : ''), true);
+    } else {
+      if (poll) { clearInterval(poll); poll = null; }
+      if (done > 0 || s.finished_at) {
+        setProgress('Done — ' + (s.moved || 0) + ' moved, ' + (s.skipped || 0) +
+          ' skipped' + (s.failed ? ', ' + s.failed + ' failed' : '') + '.', false);
+      }
+      loadBatches();
+    }
+  });
+}
+function loadBatches() {
+  fetch('/api/organize/batches').then(function (r) { return r.json(); }).then(function (res) {
+    var tb = document.querySelector('#batches tbody'); tb.innerHTML = '';
+    (res.batches || []).forEach(function (b) {
+      var tr = document.createElement('tr');
+      var fullyUndone = (b.undone >= b.total);
+      tr.innerHTML = '<td>' + (b.started || '').replace('T', ' ') + '</td><td>' + b.source +
+        '</td><td>' + (b.total - b.undone) + ' / ' + b.total + '</td><td></td>';
+      var btn = document.createElement('button');
+      btn.textContent = fullyUndone ? 'Undone' : 'Undo';
+      btn.disabled = fullyUndone;
+      btn.onclick = function () {
+        if (!confirm('Move these files back to their original locations?')) return;
+        btn.disabled = true;
+        fetch('/api/organize/undo', { method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ batch_id: b.batch_id }) }).then(function (r) { return r.json(); }).then(function (res) {
+          if (!res.ok) { setProgress(res.error || 'Undo failed', false); btn.disabled = false; return; }
+          startPolling();
+        });
+      };
+      tr.children[3].appendChild(btn);
+      tb.appendChild(tr);
+    });
+  });
+}
+loadBatches();
+tick();  // resume the progress line if a job is already running
+</script>
+</body></html>"""
 
 PAGES = {
     "media": {
