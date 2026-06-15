@@ -65,8 +65,29 @@ def is_cloud_placeholder(path: str) -> bool:
 
 
 # media-org bucket per index `kind`. Files of other kinds are not moved.
-ORGANIZE_BUCKETS = {"video": "Video", "audio": "Audio",
-                    "image": "Images", "document": "Documents"}
+# Top-level Media Org buckets are derived from kind + category (see _top_bucket).
+ORGANIZE_BUCKET_NAMES = ("Audio", "Video", "Photos", "Graphics", "Documents")
+# Image extensions treated as camera photos when the index category is missing
+# (cheap ext guess only — no file read).
+_PHOTO_EXTS = set(mi.CAMERA_EXTS) | {"jpg", "jpeg", "tif", "tiff"}
+
+
+def _top_bucket(kind: str, category, ext, skip_documents: bool):
+    """Big bucket for a file, or None if it should be skipped. Cheap signals
+    only (kind, stored category, extension) — never reads the file."""
+    if kind == "audio":
+        return "Audio"
+    if kind == "video":
+        return "Video"
+    if kind == "image":
+        if category == "photo":
+            return "Photos"
+        if category == "graphic":
+            return "Graphics"
+        return "Photos" if (ext or "").lower() in _PHOTO_EXTS else "Graphics"
+    if kind == "document":
+        return None if skip_documents else "Documents"
+    return None
 
 
 def _is_remote(source: str) -> bool:
@@ -99,10 +120,33 @@ def _already_sorted(source: str, path: str) -> bool:
         os.path.normcase(os.path.abspath(base)) + os.sep)
 
 
-def _dest_path(source: str, bucket: str, name: str) -> str:
+def _sanitize_seg(seg: str) -> str:
+    """Make a path segment safe to use as a folder name."""
+    seg = (seg or "").replace("/", "_").replace("\\", "_").strip().strip(".")
+    return seg or "_other"
+
+
+def _prev_location(source: str, original_path: str) -> str:
+    """The file's original parent-folder name (its 'previous location')."""
     if _is_remote(source):
-        return f"media-org/{bucket}/{name}"
-    return os.path.join(_media_org_root(source), bucket, name)
+        parts = original_path.replace("\\", "/").strip("/").split("/")
+        parent = parts[-2] if len(parts) >= 2 else ""
+    else:
+        parent = os.path.basename(os.path.dirname(original_path))
+    return _sanitize_seg(parent)
+
+
+def _year_of(modified) -> str:
+    """Year from the stored ISO modified date, or 'unknown'."""
+    s = str(modified or "")
+    return s[:4] if (len(s) >= 4 and s[:4].isdigit()) else "unknown"
+
+
+def _dest_path(source: str, bucket: str, subdirs: list, name: str) -> str:
+    parts = [bucket] + list(subdirs) + [name]
+    if _is_remote(source):
+        return "media-org/" + "/".join(parts)
+    return os.path.join(_media_org_root(source), *parts)
 
 
 def _dest_exists(source: str, dest: str) -> bool:
@@ -152,14 +196,16 @@ def _base_name(source: str, path: str) -> str:
     return path.rsplit("/", 1)[-1] if _is_remote(source) else os.path.basename(path)
 
 
-def organize_plan(db: sqlite3.Connection, source: str) -> dict:
-    """Preview: bucket counts for a source. Pure index query, no disk access."""
+def organize_plan(db: sqlite3.Connection, source: str,
+                  skip_documents: bool = True) -> dict:
+    """Preview: top-bucket counts for a source. Pure index query, no disk access."""
     rows = db.execute(
-        "SELECT path, kind FROM files WHERE source = ?", (source,)).fetchall()
-    counts = {"Audio": 0, "Video": 0, "Images": 0, "Documents": 0}
+        "SELECT path, kind, category, ext FROM files WHERE source = ?",
+        (source,)).fetchall()
+    counts = {b: 0 for b in ORGANIZE_BUCKET_NAMES}
     skipped = 0
     for r in rows:
-        bucket = ORGANIZE_BUCKETS.get(r["kind"])
+        bucket = _top_bucket(r["kind"], r["category"], r["ext"], skip_documents)
         if not bucket:
             continue
         if _already_sorted(source, r["path"]):
@@ -553,7 +599,7 @@ class OrganizeJobManager:
             self._state["cancelled"] = True
             return True
 
-    def enqueue_organize(self, source: str) -> str:
+    def enqueue_organize(self, source: str, skip_documents: bool = True) -> str:
         batch_id = f"{source}-{_now()}-{uuid.uuid4().hex[:8]}"
         with self._lock:
             if self._state["running"]:
@@ -562,7 +608,8 @@ class OrganizeJobManager:
             self._state.update(running=True, mode="organize", source=source,
                                batch_id=batch_id, started_at=_now())
             self._thread = threading.Thread(
-                target=self._run_organize, args=(source, batch_id), daemon=True)
+                target=self._run_organize, args=(source, batch_id, skip_documents),
+                daemon=True)
             self._thread.start()
         return batch_id
 
@@ -603,14 +650,15 @@ class OrganizeJobManager:
             self._state["current"] = ""
             self._state["finished_at"] = _now()
 
-    def _run_organize(self, source: str, batch_id: str):
+    def _run_organize(self, source: str, batch_id: str, skip_documents: bool = True):
         db = mi.get_db()
         db.row_factory = sqlite3.Row
         try:
             rows = db.execute(
-                "SELECT id, path, name, kind FROM files WHERE source = ?",
-                (source,)).fetchall()
-            todo = [r for r in rows if ORGANIZE_BUCKETS.get(r["kind"])
+                "SELECT id, path, name, kind, category, ext, modified "
+                "FROM files WHERE source = ?", (source,)).fetchall()
+            todo = [r for r in rows
+                    if _top_bucket(r["kind"], r["category"], r["ext"], skip_documents)
                     and not _already_sorted(source, r["path"])]
             self._set(total=len(todo))
             for r in todo:
@@ -623,8 +671,9 @@ class OrganizeJobManager:
                         self._inc("skipped")
                         continue
                 try:
-                    bucket = ORGANIZE_BUCKETS[r["kind"]]
-                    dest = _uniquify(source, _dest_path(source, bucket, r["name"]))
+                    bucket = _top_bucket(r["kind"], r["category"], r["ext"], skip_documents)
+                    subdirs = [_prev_location(source, src), _year_of(r["modified"])]
+                    dest = _uniquify(source, _dest_path(source, bucket, subdirs, r["name"]))
                     _move_path(source, src, dest)
                     name = _base_name(source, dest)
                     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""

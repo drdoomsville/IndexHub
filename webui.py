@@ -1482,13 +1482,15 @@ MEDIAORG_HTML = """<!doctype html>
 <div class="wrap">
   <div class="topnav"><a href="/">&larr; Home</a> &middot; <a href="/media">Media</a> &middot; <a href="/documents">Documents</a> &middot; <a href="/duplicates">Duplicates</a></div>
   <h1>Media <span>Org</span></h1>
-  <div class="sub">Pick a drive, then sort its files into <code>media-org/</code> buckets (Audio, Video, Images, Documents). Every move is remembered so you can undo a whole run.</div>
+  <div class="sub">Pick a drive, then sort its files into <code>media-org/</code> buckets (Audio, Video, Photos, Graphics, Documents), with sub-folders by original location and year. Every move is remembered so you can undo a whole run.</div>
 
   <div class="panel">
     <h3 style="margin-top:0">1. Choose a drive</h3>
     <label class="src"><input type="radio" name="src" value="local"> Local</label>
     <label class="src"><input type="radio" name="src" value="onedrive"> OneDrive</label>
     <label class="src"><input type="radio" name="src" value="gdrive"> Google Drive</label>
+    <label style="display:block;margin:10px 2px 0;font-size:13px;color:var(--muted);cursor:pointer">
+      <input type="checkbox" id="skipDocs" checked> Skip documents (media only)</label>
     <div style="margin-top:10px">
       <button id="previewBtn">Preview</button>
       <button id="organizeBtn" class="primary" disabled>Organize</button>
@@ -1509,6 +1511,13 @@ function selectedSrc() {
   var el = document.querySelector('input[name=src]:checked');
   return el ? el.value : null;
 }
+function skipDocs() { return document.getElementById('skipDocs').checked; }
+function invalidatePreview() {
+  document.getElementById('organizeBtn').disabled = true;
+  document.getElementById('preview').textContent = '';
+  lastPreviewSrc = null;
+}
+document.getElementById('skipDocs').onchange = invalidatePreview;
 function setProgress(s, active) {
   var el = document.getElementById('progress');
   el.textContent = s; el.className = active ? 'active' : '';
@@ -1524,13 +1533,14 @@ document.getElementById('previewBtn').onclick = function () {
   var src = selectedSrc();
   if (!src) { document.getElementById('preview').textContent = 'Choose a drive first.'; return; }
   document.getElementById('preview').textContent = 'Previewing…';
-  fetch('/api/organize/preview?source=' + src).then(function (r) { return r.json(); }).then(function (p) {
+  fetch('/api/organize/preview?source=' + src + '&skip_documents=' + (skipDocs() ? '1' : '0'))
+    .then(function (r) { return r.json(); }).then(function (p) {
     if (!p.ok) { document.getElementById('preview').textContent = p.error || 'Preview failed'; return; }
     var b = p.buckets;
+    var parts = 'Audio ' + b.Audio + ', Video ' + b.Video + ', Photos ' + b.Photos +
+      ', Graphics ' + b.Graphics + (skipDocs() ? '' : ', Documents ' + b.Documents);
     document.getElementById('preview').textContent =
-      p.total + ' files to sort — Audio ' + b.Audio + ', Video ' + b.Video +
-      ', Images ' + b.Images + ', Documents ' + b.Documents +
-      ' (' + p.skipped + ' already sorted, skipped)';
+      p.total + ' files to sort — ' + parts + ' (' + p.skipped + ' already sorted, skipped)';
     lastPreviewSrc = src;
     document.getElementById('organizeBtn').disabled = (p.total === 0);
   });
@@ -1541,7 +1551,7 @@ document.getElementById('organizeBtn').onclick = function () {
   if (!confirm('Move ' + src + ' files into media-org/ buckets?')) return;
   document.getElementById('organizeBtn').disabled = true;
   fetch('/api/organize/start', { method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ source: src }) }).then(function (r) { return r.json(); }).then(function (res) {
+    body: JSON.stringify({ source: src, skip_documents: skipDocs() }) }).then(function (r) { return r.json(); }).then(function (res) {
     if (!res.ok) { setProgress(res.error || 'Could not start', false); return; }
     startPolling();
   });
@@ -2519,9 +2529,10 @@ def api_organize_preview(params):
     source = (params.get("source", [""])[0] or "").strip()
     if source not in ORGANIZE_SOURCES:
         return {"ok": False, "error": "Choose a drive"}
+    skip_documents = (params.get("skip_documents", ["1"])[0] != "0")
     conn = db()
     try:
-        return file_ops.organize_plan(conn, source)
+        return file_ops.organize_plan(conn, source, skip_documents)
     finally:
         conn.close()
 
@@ -2530,8 +2541,9 @@ def api_organize_start(body):
     source = (body.get("source") or "").strip()
     if source not in ORGANIZE_SOURCES:
         return {"ok": False, "error": "Choose a drive"}
+    skip_documents = bool(body.get("skip_documents", True))
     try:
-        batch_id = file_ops.organize_jobs.enqueue_organize(source)
+        batch_id = file_ops.organize_jobs.enqueue_organize(source, skip_documents)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     return {"ok": True, "batch_id": batch_id}
