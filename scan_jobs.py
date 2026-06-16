@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
 
 import media_index as mi
+from jobs import BaseJobManager, now_iso
 
 
-class ScanJobManager:
+class ScanJobManager(BaseJobManager):
+    """A scan/hash pass on one background worker. Unlike the delete/organize
+    managers it cancels through a threading.Event handed deep into the scan,
+    and computes a richer phase/message/results snapshot when it finishes."""
+
     def __init__(self):
-        self._lock = threading.Lock()
+        super().__init__()
         self._cancel = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._state = self._idle_state()
 
     @staticmethod
-    def _idle_state() -> dict:
+    def _idle() -> dict:
         return {
             "running": False,
             "cancelling": False,
@@ -32,33 +34,16 @@ class ScanJobManager:
             "results": None,
         }
 
-    def status(self) -> dict:
-        with self._lock:
-            return dict(self._state)
-
     def start(self, sources: list[str] | None, path_prefix: str = "",
               rescan: bool = True, hash_missing: bool = True) -> bool:
         with self._lock:
             if self._state["running"]:
                 return False
             self._cancel = threading.Event()
-            self._state = {
-                "running": True,
-                "cancelling": False,
-                "phase": "starting",
-                "source": "",
-                "message": "Starting…",
-                "files": 0,
-                "total": 0,
-                "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "finished_at": None,
-                "error": None,
-                "cancelled": False,
-                "results": None,
-            }
-            args = (sources, path_prefix, rescan, hash_missing)
-            self._thread = threading.Thread(target=self._run, args=args, daemon=True)
-            self._thread.start()
+            self._state = self._idle()
+            self._state.update(running=True, phase="starting",
+                               message="Starting…", started_at=now_iso())
+            self._launch(self._run, (sources, path_prefix, rescan, hash_missing))
             return True
 
     def cancel(self) -> bool:
@@ -71,6 +56,9 @@ class ScanJobManager:
         return True
 
     def _progress(self, **kwargs):
+        # Called by media_index as a progress callback with arbitrary fields;
+        # only touch known keys, and skip None so a partial update can't wipe a
+        # value. (Differs from BaseJobManager._set, which writes unconditionally.)
         with self._lock:
             for key, value in kwargs.items():
                 if key in self._state and value is not None:
@@ -108,22 +96,15 @@ class ScanJobManager:
         except Exception as exc:
             error = str(exc)
         finally:
-            with self._lock:
-                self._state["running"] = False
-                self._state["cancelling"] = False
-                self._state["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                self._state["error"] = error
-                self._state["results"] = results
-                self._state["cancelled"] = bool(results.get("cancelled"))
-                if error:
-                    self._state["phase"] = "error"
-                    self._state["message"] = error
-                elif self._state["cancelled"]:
-                    self._state["phase"] = "cancelled"
-                    self._state["message"] = "Cancelled"
-                else:
-                    self._state["phase"] = "done"
-                    self._state["message"] = "Complete"
+            cancelled = bool(results.get("cancelled"))
+            if error:
+                phase, message = "error", error
+            elif cancelled:
+                phase, message = "cancelled", "Cancelled"
+            else:
+                phase, message = "done", "Complete"
+            self._finish(cancelling=False, error=error, results=results,
+                         cancelled=cancelled, phase=phase, message=message)
 
 
 job_manager = ScanJobManager()

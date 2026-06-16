@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 import media_index as mi
+from jobs import BaseJobManager, now_iso
 
 TRASH_ROOT = Path(__file__).parent / ".trash"
 
@@ -234,8 +235,7 @@ class FileGoneError(Exception):
     the stale index row should just be pruned."""
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+_now = now_iso   # kept as a local alias; many call sites use _now()
 
 
 def _row_dict(row: sqlite3.Row) -> dict:
@@ -491,16 +491,14 @@ class FileSessionManager:
 file_sessions = FileSessionManager()
 
 
-class DeleteJobManager:
+class DeleteJobManager(BaseJobManager):
     """Runs file deletions on a single background worker so the UI returns
     immediately and a slow remote (rclone) move doesn't block the request.
     A status snapshot drives the progress bar in the web UI."""
 
     def __init__(self):
-        self._lock = threading.Lock()
+        super().__init__()
         self._queue: list[tuple[str, str]] = []   # (session_id, file_id)
-        self._thread: threading.Thread | None = None
-        self._state = self._idle()
 
     @staticmethod
     def _idle() -> dict:
@@ -532,8 +530,7 @@ class DeleteJobManager:
                 self._state = self._idle()
                 self._state.update(running=True, total=len(ids), started_at=_now())
                 self._queue = [(session_id, i) for i in ids]
-                self._thread = threading.Thread(target=self._run, daemon=True)
-                self._thread.start()
+                self._launch(self._run)
             else:
                 self._queue.extend((session_id, i) for i in ids)
                 self._state["total"] += len(ids)
@@ -551,38 +548,23 @@ class DeleteJobManager:
                 try:
                     res = file_sessions.delete_file(db, session_id, fid)
                     name = res.get("name") or res.get("entry", {}).get("name", "")
-                    with self._lock:
-                        if res.get("pruned"):
-                            self._state["pruned"] += 1
-                        else:
-                            self._state["deleted"] += 1
-                        self._state["current"] = name
+                    self._inc("pruned" if res.get("pruned") else "deleted")
+                    self._set(current=name)
                 except Exception as exc:
-                    with self._lock:
-                        self._state["failed"] += 1
-                        if len(self._state["errors"]) < 20:
-                            self._state["errors"].append(str(exc))
+                    self._err(str(exc))
         finally:
             db.close()
-            with self._lock:
-                self._state["running"] = False
-                self._state["current"] = ""
-                self._state["finished_at"] = _now()
+            self._finish(current="")
 
 
 delete_jobs = DeleteJobManager()
 
 
-class OrganizeJobManager:
+class OrganizeJobManager(BaseJobManager):
     """Runs a Media Org organize-or-undo pass on a single background worker.
     Mirrors DeleteJobManager: one job at a time, a status snapshot for the
     progress bar, and a cancel that stops the queue (the in-flight move
     finishes — a remote move can't be safely interrupted)."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._thread: threading.Thread | None = None
-        self._state = self._idle()
 
     @staticmethod
     def _idle() -> dict:
@@ -590,10 +572,6 @@ class OrganizeJobManager:
                 "total": 0, "moved": 0, "skipped": 0, "failed": 0,
                 "current": "", "started_at": None, "finished_at": None,
                 "errors": [], "cancelled": False}
-
-    def status(self) -> dict:
-        with self._lock:
-            return dict(self._state)
 
     def cancel(self) -> bool:
         with self._lock:
@@ -610,10 +588,7 @@ class OrganizeJobManager:
             self._state = self._idle()
             self._state.update(running=True, mode="organize", source=source,
                                batch_id=batch_id, started_at=_now())
-            self._thread = threading.Thread(
-                target=self._run_organize, args=(source, batch_id, skip_documents),
-                daemon=True)
-            self._thread.start()
+            self._launch(self._run_organize, (source, batch_id, skip_documents))
         return batch_id
 
     def enqueue_undo(self, batch_id: str) -> None:
@@ -623,35 +598,7 @@ class OrganizeJobManager:
             self._state = self._idle()
             self._state.update(running=True, mode="undo", batch_id=batch_id,
                                started_at=_now())
-            self._thread = threading.Thread(
-                target=self._run_undo, args=(batch_id,), daemon=True)
-            self._thread.start()
-
-    # -- internal helpers (all take the lock) --
-    def _cancelled(self) -> bool:
-        with self._lock:
-            return self._state["cancelled"]
-
-    def _set(self, **kw):
-        with self._lock:
-            for k, v in kw.items():
-                self._state[k] = v
-
-    def _inc(self, key: str):
-        with self._lock:
-            self._state[key] += 1
-
-    def _err(self, msg: str):
-        with self._lock:
-            self._state["failed"] += 1
-            if len(self._state["errors"]) < 20:
-                self._state["errors"].append(msg)
-
-    def _finish(self):
-        with self._lock:
-            self._state["running"] = False
-            self._state["current"] = ""
-            self._state["finished_at"] = _now()
+            self._launch(self._run_undo, (batch_id,))
 
     def _run_organize(self, source: str, batch_id: str, skip_documents: bool = True):
         db = mi.get_db()
@@ -669,7 +616,7 @@ class OrganizeJobManager:
                     break
                 self._set(current=r["name"])
                 src = r["path"]
-                if source in ("local", "onedrive"):
+                if not _is_remote(source):
                     if not exists_on_disk(src) or is_cloud_placeholder(src):
                         self._inc("skipped")
                         continue
@@ -704,7 +651,7 @@ class OrganizeJobManager:
                     self._err(f"{r['name']}: {exc}")
         finally:
             db.close()
-            self._finish()
+            self._finish(current="")
 
     def _run_undo(self, batch_id: str):
         db = mi.get_db()
@@ -720,7 +667,7 @@ class OrganizeJobManager:
                 source = r["source"]
                 self._set(current=_base_name(source, r["new_path"]))
                 try:
-                    if source in ("local", "onedrive") and not exists_on_disk(r["new_path"]):
+                    if not _is_remote(source) and not exists_on_disk(r["new_path"]):
                         # Already gone from the sorted location; just clear the log.
                         mi._write_with_retry(db,
                             "UPDATE media_org_moves SET undone=1 WHERE id=?", (r["id"],))
@@ -741,7 +688,7 @@ class OrganizeJobManager:
                     self._err(f"undo {r['new_path']}: {exc}")
         finally:
             db.close()
-            self._finish()
+            self._finish(current="")
 
 
 organize_jobs = OrganizeJobManager()
