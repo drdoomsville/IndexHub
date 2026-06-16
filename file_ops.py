@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
-import subprocess
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -155,10 +154,7 @@ def _dest_path(source: str, bucket: str, subdirs: list, name: str) -> str:
 
 def _dest_exists(source: str, dest: str) -> bool:
     if _is_remote(source):
-        proc = subprocess.run(
-            [mi.find_rclone(), "lsf", mi.rclone_full_path(source, dest)],
-            capture_output=True, text=True, encoding="utf-8")
-        return proc.returncode == 0 and bool(proc.stdout.strip())
+        return mi.rclone.exists(source, dest)
     return exists_on_disk(dest)
 
 
@@ -184,13 +180,10 @@ def _uniquify(source: str, dest: str) -> str:
 
 def _move_path(source: str, src: str, dest: str) -> None:
     if _is_remote(source):
-        proc = subprocess.run(
-            [mi.find_rclone(), "moveto",
-             mi.rclone_full_path(source, src),
-             mi.rclone_full_path(source, dest)],
-            capture_output=True, text=True, encoding="utf-8")
-        if proc.returncode != 0:
-            raise ValueError(f"Move failed: {proc.stderr.strip()[:300]}")
+        try:
+            mi.rclone.move(source, src, dest)
+        except mi.RcloneError as exc:
+            raise ValueError(f"Move failed: {exc.stderr[:300]}")
         return
     os.makedirs(long_path(os.path.dirname(dest)), exist_ok=True)
     shutil.move(long_path(src), long_path(dest))
@@ -281,15 +274,9 @@ class FileSessionManager:
         # Purge each remote's per-session trash folder in a single rclone call.
         for source in remote_sources:
             try:
-                proc = subprocess.run(
-                    [mi.find_rclone(), "purge",
-                     mi.rclone_full_path(source, f".indexhub-trash/{session_id}")],
-                    capture_output=True, text=True, encoding="utf-8")
-                low = proc.stderr.lower()
-                if proc.returncode != 0 and not (
-                        "not found" in low or "doesn't exist" in low
-                        or "does not exist" in low or "no such" in low):
-                    errors.append(f"{source}: {proc.stderr.strip()[:200]}")
+                mi.rclone.purge(source, f".indexhub-trash/{session_id}")
+            except mi.RcloneError as exc:
+                errors.append(f"{source}: {exc.stderr[:200]}")
             except OSError as exc:
                 errors.append(f"{source}: {exc}")
         return {"ok": True, "removed": removed, "errors": errors}
@@ -420,19 +407,12 @@ class FileSessionManager:
             shutil.move(long_path(row["path"]), str(dest))
             return str(dest)
         trash_rel = f".indexhub-trash/{session_id}/{entry_id}_{name}"
-        proc = subprocess.run(
-            [mi.find_rclone(), "moveto",
-             mi.rclone_full_path(source, row["path"]),
-             mi.rclone_full_path(source, trash_rel)],
-            capture_output=True, text=True, encoding="utf-8",
-        )
-        if proc.returncode != 0:
-            err = proc.stderr.strip()
-            low = err.lower()
-            if ("not found" in low or "doesn't exist" in low
-                    or "does not exist" in low or "no such" in low):
+        try:
+            mi.rclone.move(source, row["path"], trash_rel)
+        except mi.RcloneError as exc:
+            if mi.rclone.is_missing(exc.stderr):
                 raise FileGoneError("File missing on remote")
-            raise ValueError(f"Delete failed: {err[:300]}")
+            raise ValueError(f"Delete failed: {exc.stderr[:300]}")
         return trash_rel
 
     def _restore_from_trash(self, entry: dict):
@@ -447,14 +427,10 @@ class FileSessionManager:
                 raise ValueError("Cannot restore: original path already occupied")
             shutil.move(str(src), long_path(entry["original_path"]))
             return
-        proc = subprocess.run(
-            [mi.find_rclone(), "moveto",
-             mi.rclone_full_path(source, entry["trash_path"]),
-             mi.rclone_full_path(source, entry["original_path"])],
-            capture_output=True, text=True, encoding="utf-8",
-        )
-        if proc.returncode != 0:
-            raise ValueError(f"Restore failed: {proc.stderr.strip()[:300]}")
+        try:
+            mi.rclone.move(source, entry["trash_path"], entry["original_path"])
+        except mi.RcloneError as exc:
+            raise ValueError(f"Restore failed: {exc.stderr[:300]}")
 
     @staticmethod
     def _dest_path(row: sqlite3.Row, dest_dir: str) -> str:
@@ -476,15 +452,11 @@ class FileSessionManager:
             shutil.move(str(src), str(dest))
             return str(dest)
         new_rel = self._dest_path(row, dest_dir)
-        proc = subprocess.run(
-            [mi.find_rclone(), "moveto",
-             mi.rclone_full_path(source, row["path"]),
-             mi.rclone_full_path(source, new_rel)],
-            capture_output=True, text=True, encoding="utf-8",
-        )
-        if proc.returncode != 0:
+        try:
+            mi.rclone.move(source, row["path"], new_rel)
+        except mi.RcloneError as exc:
             label = "Google Drive" if source == "gdrive" else "QNAP"
-            raise ValueError(f"{label} move failed: {proc.stderr.strip()[:300]}")
+            raise ValueError(f"{label} move failed: {exc.stderr[:300]}")
         return new_rel
 
 

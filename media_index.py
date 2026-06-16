@@ -80,20 +80,18 @@ def qnap_device_identity(cfg: dict) -> tuple[str, str]:
 def ensure_qnap_rclone_remote(cfg: dict):
     """Create/update the rclone SMB remote used for QNAP scans."""
     args = [
-        find_rclone(), "config", "create", "qnap", "smb",
+        "config", "create", "qnap", "smb",
         f"host={cfg['host']}",
         f"user={cfg['user']}",
         f"pass={cfg['pass']}",
         "port=445",
         "config_is_local=true",
     ]
-    proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
+    proc = rclone.run(args)
     if proc.returncode != 0 and "already exists" not in proc.stderr.lower():
         # Remote may exist with different settings — recreate it.
-        subprocess.run(
-            [find_rclone(), "config", "delete", "qnap", "config_is_local=true"],
-            capture_output=True, text=True, encoding="utf-8")
-        proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
+        rclone.run(["config", "delete", "qnap", "config_is_local=true"])
+        proc = rclone.run(args)
         if proc.returncode != 0:
             raise RuntimeError(f"rclone QNAP setup failed: {proc.stderr.strip()[:500]}")
 
@@ -122,20 +120,106 @@ def reveal_path(source: str, rel_path: str) -> str | None:
         return None
 
 
+# --- rclone adapter -----------------------------------------------------------
+# Every rclone subprocess goes through here: command construction (the binary +
+# the (source, rel) -> remote path build), the standard text/utf-8 invocation,
+# missing-file detection, and stdout parsing. Callers ask for an operation
+# (move/exists/purge/hash/...) instead of assembling command lines, which means
+# they can be exercised without a live remote by stubbing Rclone.run.
+
+_MISSING_MARKERS = ("not found", "doesn't exist", "does not exist", "no such")
+
+
+class RcloneError(RuntimeError):
+    """An rclone command exited non-zero. `.stderr` holds its trimmed output."""
+
+    def __init__(self, stderr: str):
+        self.stderr = (stderr or "").strip()
+        super().__init__(self.stderr[:300])
+
+
+class Rclone:
+    """Single seam for rclone. Remote paths are built from (source, rel)."""
+
+    @staticmethod
+    def is_missing(stderr: str) -> bool:
+        """True if stderr says the source path didn't exist (vs a real error)."""
+        low = (stderr or "").lower()
+        return any(m in low for m in _MISSING_MARKERS)
+
+    def _full(self, source: str, rel: str) -> str:
+        return rclone_full_path(source, rel)
+
+    def run(self, args: list[str], **kw) -> subprocess.CompletedProcess:
+        """Run rclone with the standard capture/text/utf-8 defaults."""
+        kw.setdefault("capture_output", True)
+        kw.setdefault("text", True)
+        kw.setdefault("encoding", "utf-8")
+        return subprocess.run([find_rclone(), *args], **kw)
+
+    def popen(self, args: list[str], **kw) -> subprocess.Popen:
+        return subprocess.Popen([find_rclone(), *args], **kw)
+
+    def move(self, source: str, src_rel: str, dest_rel: str) -> None:
+        """rclone moveto; raises RcloneError on failure."""
+        proc = self.run(["moveto", self._full(source, src_rel),
+                         self._full(source, dest_rel)])
+        if proc.returncode != 0:
+            raise RcloneError(proc.stderr)
+
+    def exists(self, source: str, rel: str) -> bool:
+        proc = self.run(["lsf", self._full(source, rel)])
+        return proc.returncode == 0 and bool(proc.stdout.strip())
+
+    def purge(self, source: str, rel: str) -> None:
+        """rclone purge; tolerates an already-missing path, raises otherwise."""
+        proc = self.run(["purge", self._full(source, rel)])
+        if proc.returncode != 0 and not self.is_missing(proc.stderr):
+            raise RcloneError(proc.stderr)
+
+    def hash_sha256(self, source: str, rel: str) -> str | None:
+        proc = self.run(["hashsum", "SHA256", "--download", self._full(source, rel)])
+        if proc.returncode != 0:
+            return None
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith(";"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2 and len(parts[0]) == 64:
+                return parts[0].lower()
+        return None
+
+    def lsjson(self, source: str, rel: str, timeout: float | None = None):
+        """Parsed `rclone lsjson` list, or None on a non-zero exit / bad JSON.
+        A timeout (TimeoutExpired) is left to propagate, as before."""
+        proc = self.run(["lsjson", self._full(source, rel)], timeout=timeout)
+        if proc.returncode != 0:
+            return None
+        try:
+            return json.loads(proc.stdout or "[]")
+        except (ValueError, json.JSONDecodeError):
+            return None
+
+    def cat_popen(self, source: str, rel: str) -> subprocess.Popen:
+        """Streaming `rclone cat` for serving remote file bytes."""
+        return self.popen(["cat", self._full(source, rel)],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+rclone = Rclone()
+
+
 def gdrive_web_url(rel_path: str) -> str | None:
     """Resolve a gdrive file's Google Drive web URL via its Drive ID.
 
     Uses `rclone lsjson` (a read-only call, so it works regardless of the
     remote's write scope). Returns None if the file or its ID can't be found."""
     try:
-        proc = subprocess.run(
-            [find_rclone(), "lsjson", rclone_full_path("gdrive", rel_path)],
-            capture_output=True, text=True, encoding="utf-8", timeout=30,
-        )
-        if proc.returncode != 0:
-            return None
-        data = json.loads(proc.stdout or "[]")
-    except (OSError, ValueError, json.JSONDecodeError):
+        data = rclone.lsjson("gdrive", rel_path, timeout=30)
+    except OSError:
+        return None
+    if data is None:
         return None
     for entry in data:
         if not entry.get("IsDir") and entry.get("ID"):
@@ -153,8 +237,8 @@ def scan_qnap(cancel_event=None, path_prefix: str = ""):
         )
     ensure_qnap_rclone_remote(cfg)
     root = qnap_scan_root(cfg)
-    proc = subprocess.Popen(
-        [find_rclone(), "lsf", "-R", "--files-only", "--fast-list",
+    proc = rclone.popen(
+        ["lsf", "-R", "--files-only", "--fast-list",
          "--format", "tsp", "--separator", "|",
          "--filter", "- @Recently-Snapshot/**",
          "--filter", f"- {TRASH_DIR_NAME}/**", root],
@@ -224,21 +308,7 @@ def hash_local_file(path: str, cancel_event=None) -> str | None:
 def hash_remote_file(source: str, rel_path: str, cancel_event=None) -> str | None:
     if cancel_event is not None and cancel_event.is_set():
         return None
-    remote = rclone_full_path(source, rel_path)
-    proc = subprocess.run(
-        [find_rclone(), "hashsum", "SHA256", "--download", remote],
-        capture_output=True, text=True, encoding="utf-8",
-    )
-    if proc.returncode != 0:
-        return None
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line or line.startswith(";"):
-            continue
-        parts = line.split(None, 1)
-        if len(parts) == 2 and len(parts[0]) == 64:
-            return parts[0].lower()
-    return None
+    return rclone.hash_sha256(source, rel_path)
 
 
 def hash_file_row(source: str, path: str, cancel_event=None) -> str | None:

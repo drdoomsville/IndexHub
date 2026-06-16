@@ -2067,14 +2067,11 @@ def api_rename(body):
     elif row["source"] in ("gdrive", "qnap"):
         old_rel = row["path"]
         new_rel = str(PurePosixPath(old_rel).with_name(new_name))
-        proc = subprocess.run(
-            [mi.find_rclone(), "moveto",
-             mi.rclone_full_path(row["source"], old_rel),
-             mi.rclone_full_path(row["source"], new_rel)],
-            capture_output=True, text=True, encoding="utf-8")
-        if proc.returncode != 0:
+        try:
+            mi.rclone.move(row["source"], old_rel, new_rel)
+        except mi.RcloneError as exc:
             label = "Google Drive" if row["source"] == "gdrive" else "QNAP"
-            raise ValueError(f"{label} rename failed: {proc.stderr.strip()[:300]}")
+            raise ValueError(f"{label} rename failed: {exc.stderr[:300]}")
         new_path = new_rel
 
     new_ext = new_name.rsplit(".", 1)[-1].lower() if "." in new_name else ""
@@ -2790,9 +2787,7 @@ class Handler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
     def _stream_remote(self, row, ctype):
-        proc = subprocess.Popen(
-            [mi.find_rclone(), "cat", mi.rclone_full_path(row["source"], row["path"])],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = mi.rclone.cat_popen(row["source"], row["path"])
         try:
             self.send_response(200)
             self.send_header("Content-Type", ctype)
