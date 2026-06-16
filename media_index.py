@@ -104,17 +104,10 @@ def qnap_scan_root(cfg: dict) -> str:
 
 
 def rclone_full_path(source: str, rel_path: str) -> str:
-    """Build a full rclone remote path for gdrive/qnap rows."""
-    if source == "gdrive":
-        return f"{GDRIVE_REMOTE}{rel_path}"
-    if source == "qnap":
-        cfg = load_qnap_config()
-        if not cfg:
-            raise RuntimeError("QNAP not configured")
-        root = qnap_scan_root(cfg)
-        rel = rel_path.lstrip("/\\")
-        return f"{root}/{rel}" if rel else root
-    raise ValueError(f"not a remote source: {source}")
+    """Build a full rclone remote path for gdrive/qnap rows.
+
+    Thin delegator over the source registry; see get_source / Source."""
+    return get_source(source).remote_path(rel_path)
 
 
 def reveal_path(source: str, rel_path: str) -> str | None:
@@ -123,23 +116,10 @@ def reveal_path(source: str, rel_path: str) -> str | None:
 
     local/onedrive rows are already absolute paths; qnap rows are SMB-relative
     and become a UNC path \\\\host\\share\\rel."""
-    if source in ("local", "onedrive"):
-        return os.path.normpath(rel_path)
-    if source == "qnap":
-        cfg = load_qnap_config()
-        if not cfg:
-            return None
-        rel = rel_path.replace("/", "\\").lstrip("\\")
-        # Prefer a mapped network drive (e.g. Z:) if the share root is mounted
-        # locally — Explorer opens it instantly with no credential prompt.
-        drive = (cfg.get("mapped_drive") or "").strip().rstrip("\\")
-        if drive:
-            if not drive.endswith(":"):
-                drive += ":"
-            return f"{drive}\\{rel}"
-        share = (cfg.get("share") or "Public").strip("/\\")
-        return f"\\\\{cfg['host']}\\{share}\\{rel}"
-    return None
+    try:
+        return get_source(source).reveal_path(rel_path)
+    except ValueError:
+        return None
 
 
 def gdrive_web_url(rel_path: str) -> str | None:
@@ -262,11 +242,10 @@ def hash_remote_file(source: str, rel_path: str, cancel_event=None) -> str | Non
 
 
 def hash_file_row(source: str, path: str, cancel_event=None) -> str | None:
-    if source in ("local", "onedrive"):
-        return hash_local_file(path, cancel_event)
-    if source in ("gdrive", "qnap"):
-        return hash_remote_file(source, path, cancel_event)
-    return None
+    try:
+        return get_source(source).hash_file(path, cancel_event)
+    except ValueError:
+        return None
 
 
 def default_sources() -> list[str]:
@@ -1000,35 +979,151 @@ def run_hash_pass(db: sqlite3.Connection, sources: list[str] | None = None,
     return done
 
 
-def iter_source_rows(source: str, path_prefix: str = "", cancel_event=None):
-    local_device_id, local_device_label = get_machine_identity()
-    qnap_cfg = load_qnap_config()
-    if source == "local":
+# --- Source adapters ----------------------------------------------------------
+# Everything that varies per source (local / onedrive / gdrive / qnap) lives
+# behind one Source object, so callers ask the source instead of branching on
+# its name in a dozen places. `is_remote` means "stored via rclone; the row's
+# path is a remote-relative POSIX string" — true for gdrive and qnap. local and
+# onedrive paths are absolute on the local filesystem.
+
+class Source:
+    """Interface every source satisfies. Subclasses override what differs."""
+    name = ""
+    is_remote = False
+
+    def scan(self, path_prefix: str = "", cancel_event=None):
+        """Yield (path, name, ext, kind, size, modified, category) rows."""
+        raise NotImplementedError
+
+    def device_identity(self) -> tuple[str, str]:
+        """(device_id, device_label) for rows from this source."""
+        raise NotImplementedError
+
+    def hash_file(self, path: str, cancel_event=None) -> str | None:
+        raise NotImplementedError
+
+    def reveal_path(self, rel_path: str) -> str | None:
+        """A Windows path Explorer can select, or None if not browsable."""
+        return None
+
+    def remote_path(self, rel_path: str) -> str:
+        """Full rclone remote path; only valid for remote sources."""
+        raise ValueError(f"not a remote source: {self.name}")
+
+
+class _LocalDiskSource(Source):
+    """Shared behaviour for on-disk sources (local, onedrive)."""
+    is_remote = False
+
+    def device_identity(self):
+        return get_machine_identity()
+
+    def hash_file(self, path, cancel_event=None):
+        return hash_local_file(path, cancel_event)
+
+    def reveal_path(self, rel_path):
+        return os.path.normpath(rel_path)
+
+
+class LocalSource(_LocalDiskSource):
+    name = "local"
+
+    def scan(self, path_prefix="", cancel_event=None):
         return _filter_rows(
             walk_filesystem(LOCAL_ROOTS, exclude=ONEDRIVE_ROOT,
                             path_prefix=path_prefix, cancel_event=cancel_event),
             path_prefix, cancel_event)
-    if source == "onedrive":
+
+
+class OneDriveSource(_LocalDiskSource):
+    name = "onedrive"
+
+    def scan(self, path_prefix="", cancel_event=None):
         roots = [Path(path_prefix)] if path_prefix else [ONEDRIVE_ROOT]
         return _filter_rows(
             walk_filesystem(roots, path_prefix=path_prefix, cancel_event=cancel_event),
             path_prefix, cancel_event)
-    if source == "gdrive":
+
+
+class _RcloneSource(Source):
+    """Shared behaviour for remote sources reached through rclone."""
+    is_remote = True
+
+    def hash_file(self, path, cancel_event=None):
+        return hash_remote_file(self.name, path, cancel_event)
+
+
+class GDriveSource(_RcloneSource):
+    name = "gdrive"
+
+    def scan(self, path_prefix="", cancel_event=None):
         return _filter_rows(scan_gdrive(path_prefix), path_prefix, cancel_event)
-    if source == "qnap":
-        return _filter_rows(scan_qnap(cancel_event, path_prefix), path_prefix, cancel_event)
-    raise ValueError(f"unknown source: {source}")
+
+    def device_identity(self):
+        return "gdrive-shared", "Google Drive remote"
+
+    def remote_path(self, rel_path):
+        return f"{GDRIVE_REMOTE}{rel_path}"
+
+
+class QnapSource(_RcloneSource):
+    name = "qnap"
+
+    def scan(self, path_prefix="", cancel_event=None):
+        return _filter_rows(
+            scan_qnap(cancel_event, path_prefix), path_prefix, cancel_event)
+
+    def device_identity(self):
+        cfg = load_qnap_config()
+        if cfg:
+            return qnap_device_identity(cfg)
+        return "unknown", self.name
+
+    def reveal_path(self, rel_path):
+        cfg = load_qnap_config()
+        if not cfg:
+            return None
+        rel = rel_path.replace("/", "\\").lstrip("\\")
+        # Prefer a mapped network drive (e.g. Z:) if the share root is mounted
+        # locally — Explorer opens it instantly with no credential prompt.
+        drive = (cfg.get("mapped_drive") or "").strip().rstrip("\\")
+        if drive:
+            if not drive.endswith(":"):
+                drive += ":"
+            return f"{drive}\\{rel}"
+        share = (cfg.get("share") or "Public").strip("/\\")
+        return f"\\\\{cfg['host']}\\{share}\\{rel}"
+
+    def remote_path(self, rel_path):
+        cfg = load_qnap_config()
+        if not cfg:
+            raise RuntimeError("QNAP not configured")
+        root = qnap_scan_root(cfg)
+        rel = rel_path.lstrip("/\\")
+        return f"{root}/{rel}" if rel else root
+
+
+_SOURCES = {s.name: s for s in
+            (LocalSource(), OneDriveSource(), GDriveSource(), QnapSource())}
+
+
+def get_source(name: str) -> Source:
+    """The single point of source dispatch. Raises ValueError on unknown name."""
+    try:
+        return _SOURCES[name]
+    except KeyError:
+        raise ValueError(f"unknown source: {name}")
+
+
+def iter_source_rows(source: str, path_prefix: str = "", cancel_event=None):
+    return get_source(source).scan(path_prefix, cancel_event)
 
 
 def device_for_source(source: str) -> tuple[str, str]:
-    if source in ("local", "onedrive"):
-        return get_machine_identity()
-    if source == "gdrive":
-        return "gdrive-shared", "Google Drive remote"
-    qnap_cfg = load_qnap_config()
-    if source == "qnap" and qnap_cfg:
-        return qnap_device_identity(qnap_cfg)
-    return "unknown", source
+    try:
+        return get_source(source).device_identity()
+    except ValueError:
+        return "unknown", source
 
 
 def scan_sources(sources: list[str] | None = None, path_prefix: str = "",

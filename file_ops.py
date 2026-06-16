@@ -91,7 +91,10 @@ def _top_bucket(kind: str, category, ext, skip_documents: bool):
 
 
 def _is_remote(source: str) -> bool:
-    return source == "gdrive"
+    """True when rows are stored via rclone (gdrive, qnap) rather than on the
+    local filesystem. Delegates to the source registry so this concept lives in
+    exactly one place (see media_index.Source.is_remote)."""
+    return mi.get_source(source).is_remote
 
 
 def source_root(source: str) -> str:
@@ -409,7 +412,7 @@ class FileSessionManager:
     def _move_to_trash(self, session_id: str, entry_id: str, row: sqlite3.Row) -> str:
         source = row["source"]
         name = row["name"]
-        if source in ("local", "onedrive"):
+        if not _is_remote(source):
             if not exists_on_disk(row["path"]):
                 raise FileGoneError("File missing on disk")
             dest = self._session_trash_dir(session_id) / source / f"{entry_id}_{name}"
@@ -434,7 +437,7 @@ class FileSessionManager:
 
     def _restore_from_trash(self, entry: dict):
         source = entry["source"]
-        if source in ("local", "onedrive"):
+        if not _is_remote(source):
             src = Path(entry["trash_path"])
             dest = Path(entry["original_path"])
             if not src.is_file():
@@ -455,7 +458,7 @@ class FileSessionManager:
 
     @staticmethod
     def _dest_path(row: sqlite3.Row, dest_dir: str) -> str:
-        if row["source"] in ("local", "onedrive"):
+        if not _is_remote(row["source"]):
             return str(Path(dest_dir) / Path(row["path"]).name)
         dest_posix = dest_dir.replace("\\", "/").strip("/")
         name = PurePosixPath(row["path"]).name
@@ -463,7 +466,7 @@ class FileSessionManager:
 
     def _move_on_disk(self, row: sqlite3.Row, dest_dir: str) -> str:
         source = row["source"]
-        if source in ("local", "onedrive"):
+        if not _is_remote(source):
             src = Path(row["path"])
             if not Path(dest_dir).is_dir():
                 raise ValueError("Destination folder does not exist")
