@@ -176,7 +176,8 @@ def scan_qnap(cancel_event=None, path_prefix: str = ""):
     proc = subprocess.Popen(
         [find_rclone(), "lsf", "-R", "--files-only", "--fast-list",
          "--format", "tsp", "--separator", "|",
-         "--filter", "- @Recently-Snapshot/**", root],
+         "--filter", "- @Recently-Snapshot/**",
+         "--filter", f"- {TRASH_DIR_NAME}/**", root],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
     )
     assert proc.stdout is not None
@@ -348,8 +349,13 @@ DOC_CATEGORIES = {
 EXT_TO_DOC_CATEGORY = {ext: cat for cat, exts in DOC_CATEGORIES.items() for ext in exts}
 
 # Directories that are all noise for a personal file index.
+# IndexHub's own per-session trash folder, created at the root of remote
+# sources (gdrive/qnap) by file_ops when files are deleted. The scanner must
+# never index it, or trashed files reappear as duplicates of the originals.
+TRASH_DIR_NAME = ".indexhub-trash"
+
 EXCLUDE_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv",
-                "$recycle.bin", ".vs", "obj", "bin"}
+                "$recycle.bin", ".vs", "obj", "bin", TRASH_DIR_NAME}
 
 # --- photo vs computer-image (graphic) detection -------------------------------
 
@@ -731,6 +737,8 @@ def scan_gdrive(path_prefix: str = ""):
         raise RuntimeError(f"rclone failed: {proc.stderr.strip()[:500]}")
     for item in json.loads(proc.stdout):
         if not _path_matches_prefix(item["Path"], path_prefix):
+            continue
+        if item["Path"].split("/", 1)[0] == TRASH_DIR_NAME:
             continue
         name = item["Name"]
         kind = classify(name)
