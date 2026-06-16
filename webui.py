@@ -2291,6 +2291,79 @@ def api_organize_undo(body):
     return {"ok": True}
 
 
+# --- request routing ----------------------------------------------------------
+# One table per HTTP method maps a path to a handler. The dispatcher (do_GET /
+# do_POST) handles session setup, body parsing, 404s, and — for POST — a single
+# error-wrapping policy per route, so handlers don't repeat try/except boilerplate.
+
+_HTML = "text/html; charset=utf-8"
+
+# POST error policies (the 2nd item of each _POST_ROUTES entry):
+_ERR_VALUE = "__value__"           # ValueError -> {"error": str}; others propagate
+_ERR_UNEXPECTED = "__unexpected__"  # ValueError -> str; any other -> "Unexpected error: ..."
+# any other non-empty string  -> a prefix: every exception -> "{prefix}: {exc}"
+# None                        -> no wrapping (handler returns its own {"ok": False})
+
+
+def _wrap_post_error(exc: Exception, policy):
+    if policy == _ERR_VALUE:
+        if isinstance(exc, ValueError):
+            return {"ok": False, "error": str(exc)}
+        raise exc
+    if policy == _ERR_UNEXPECTED:
+        if isinstance(exc, ValueError):
+            return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": f"Unexpected error: {exc}"}
+    if isinstance(policy, str):     # prefix policy wraps every exception
+        return {"ok": False, "error": f"{policy}: {exc}"}
+    raise exc                       # policy is None -> no wrapping
+
+
+_GET_ROUTES = {
+    "/":                       lambda s, u: s._send(200, render_page(LANDING_HTML), _HTML),
+    "/media":                  lambda s, u: s._send(200, render_app("media"), _HTML),
+    "/documents":              lambda s, u: s._send(200, render_app("documents"), _HTML),
+    "/duplicates":             lambda s, u: s._send(200, render_page(DUPS_HTML), _HTML),
+    "/media-org":              lambda s, u: s._send(200, render_page(MEDIAORG_HTML), _HTML),
+    # The report is now the Overview tab of /duplicates; keep old links working.
+    "/duplicates/report":      lambda s, u: s._redirect("/duplicates?view=overview"),
+    "/api/file":               lambda s, u: s._serve_file(parse_qs(u.query)),
+    "/api/stats":              lambda s, u: s._json(api_stats(parse_qs(u.query))),
+    "/api/search":             lambda s, u: s._json(api_search(parse_qs(u.query))),
+    "/api/facets":             lambda s, u: s._json(api_facets(parse_qs(u.query))),
+    "/api/suggest":            lambda s, u: s._json(api_suggest(parse_qs(u.query))),
+    "/api/duplicates":         lambda s, u: s._json(api_duplicates(parse_qs(u.query))),
+    "/api/duplicates/report":  lambda s, u: s._json(api_duplicates_report(parse_qs(u.query))),
+    "/api/duplicates/summary": lambda s, u: s._json(api_duplicates_summary()),
+    "/api/scan/status":        lambda s, u: s._json(api_scan_status()),
+    "/api/delete/status":      lambda s, u: s._json(api_delete_status()),
+    "/api/trash":              lambda s, u: s._json(api_trash(s.session_id)),
+    "/api/organize/preview":   lambda s, u: s._json(api_organize_preview(parse_qs(u.query))),
+    "/api/organize/status":    lambda s, u: s._json(api_organize_status()),
+    "/api/organize/batches":   lambda s, u: s._json(api_organize_batches()),
+}
+
+_POST_ROUTES = {
+    "/api/scan/start":      (lambda s, b: api_scan_start(b), None),
+    "/api/scan/cancel":     (lambda s, b: api_scan_cancel(), None),
+    "/api/delete/cancel":   (lambda s, b: api_delete_cancel(), None),
+    "/api/organize/start":  (lambda s, b: api_organize_start(b), None),
+    "/api/organize/cancel": (lambda s, b: api_organize_cancel(), None),
+    "/api/organize/undo":   (lambda s, b: api_organize_undo(b), None),
+    "/api/trash/empty":     (lambda s, b: api_trash_empty(s.session_id), None),
+    "/api/mark-delete":     (lambda s, b: api_mark_delete(b, s.session_id), _ERR_VALUE),
+    "/api/delete":          (lambda s, b: api_delete_file(b, s.session_id), _ERR_VALUE),
+    "/api/delete-batch":    (lambda s, b: api_delete_batch(b, s.session_id), _ERR_VALUE),
+    "/api/restore":         (lambda s, b: api_restore_file(b, s.session_id), _ERR_VALUE),
+    "/api/move":            (lambda s, b: api_move_file(b, s.session_id), _ERR_VALUE),
+    "/api/ingest":          (lambda s, b: api_ingest(b, s._token_ok()), "Ingest failed"),
+    "/api/reveal":          (lambda s, b: api_reveal(b), "Open folder failed"),
+    "/api/prune-missing":   (lambda s, b: api_prune_missing(), "Prune failed"),
+    "/api/rename":          (lambda s, b: api_rename(b), _ERR_UNEXPECTED),
+    "/api/reclassify":      (lambda s, b: api_reclassify(b), _ERR_UNEXPECTED),
+}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     session_id = ""
@@ -2299,6 +2372,14 @@ class Handler(BaseHTTPRequestHandler):
     def _ensure_session(self):
         self.session_id, self.session_is_new = file_ops.parse_session_id(
             self.headers.get("Cookie"))
+
+    def _token_ok(self) -> bool:
+        expected = os.environ.get("INDEXHUB_TOKEN")
+        return (not expected) or (self.headers.get("X-IndexHub-Token") == expected)
+
+    def _read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(length) or b"{}") if length else {}
 
     def _maybe_set_session_cookie(self):
         if self.session_is_new:
@@ -2310,142 +2391,30 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._ensure_session()
         url = urlparse(self.path)
-        if url.path == "/":
-            self._send(200, render_page(LANDING_HTML), "text/html; charset=utf-8")
-        elif url.path in ("/media", "/documents"):
-            self._send(200, render_app(url.path[1:]), "text/html; charset=utf-8")
-        elif url.path == "/duplicates":
-            self._send(200, render_page(DUPS_HTML), "text/html; charset=utf-8")
-        elif url.path == "/duplicates/report":
-            # The report is now the Overview tab of /duplicates; keep old
-            # bookmarks and deep-links working.
-            self._redirect("/duplicates?view=overview")
-        elif url.path == "/api/duplicates/report":
-            self._json(api_duplicates_report(parse_qs(url.query)))
-        elif url.path == "/api/stats":
-            self._json(api_stats(parse_qs(url.query)))
-        elif url.path == "/api/search":
-            self._json(api_search(parse_qs(url.query)))
-        elif url.path == "/api/facets":
-            self._json(api_facets(parse_qs(url.query)))
-        elif url.path == "/api/suggest":
-            self._json(api_suggest(parse_qs(url.query)))
-        elif url.path == "/api/file":
-            self._serve_file(parse_qs(url.query))
-        elif url.path == "/api/duplicates":
-            self._json(api_duplicates(parse_qs(url.query)))
-        elif url.path == "/api/duplicates/summary":
-            self._json(api_duplicates_summary())
-        elif url.path == "/api/scan/status":
-            self._json(api_scan_status())
-        elif url.path == "/api/delete/status":
-            self._json(api_delete_status())
-        elif url.path == "/api/trash":
-            self._json(api_trash(self.session_id))
-        elif url.path == "/media-org":
-            self._send(200, render_page(MEDIAORG_HTML), "text/html; charset=utf-8")
-        elif url.path == "/api/organize/preview":
-            self._json(api_organize_preview(parse_qs(url.query)))
-        elif url.path == "/api/organize/status":
-            self._json(api_organize_status())
-        elif url.path == "/api/organize/batches":
-            self._json(api_organize_batches())
-        else:
+        route = _GET_ROUTES.get(url.path)
+        if route is None:
             self._send(404, b"not found", "text/plain")
+            return
+        route(self, url)
 
     def do_POST(self):
         self._ensure_session()
         url = urlparse(self.path)
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+            body = self._read_json_body()
         except json.JSONDecodeError:
             self._json({"ok": False, "error": "Invalid JSON body"})
             return
-
-        if url.path == "/api/scan/start":
-            self._json(api_scan_start(body))
-            return
-        if url.path == "/api/scan/cancel":
-            self._json(api_scan_cancel())
-            return
-        if url.path == "/api/delete/cancel":
-            self._json(api_delete_cancel())
-            return
-        if url.path == "/api/organize/start":
-            self._json(api_organize_start(body))
-            return
-        if url.path == "/api/organize/cancel":
-            self._json(api_organize_cancel())
-            return
-        if url.path == "/api/organize/undo":
-            self._json(api_organize_undo(body))
-            return
-        if url.path == "/api/mark-delete":
-            try:
-                self._json(api_mark_delete(body, self.session_id))
-            except ValueError as exc:
-                self._json({"ok": False, "error": str(exc)})
-            return
-        if url.path == "/api/delete":
-            try:
-                self._json(api_delete_file(body, self.session_id))
-            except ValueError as exc:
-                self._json({"ok": False, "error": str(exc)})
-            return
-        if url.path == "/api/delete-batch":
-            try:
-                self._json(api_delete_batch(body, self.session_id))
-            except ValueError as exc:
-                self._json({"ok": False, "error": str(exc)})
-            return
-        if url.path == "/api/ingest":
-            expected = os.environ.get("INDEXHUB_TOKEN")
-            token_ok = (not expected) or (self.headers.get("X-IndexHub-Token") == expected)
-            try:
-                self._json(api_ingest(body, token_ok))
-            except Exception as exc:
-                self._json({"ok": False, "error": f"Ingest failed: {exc}"})
-            return
-        if url.path == "/api/restore":
-            try:
-                self._json(api_restore_file(body, self.session_id))
-            except ValueError as exc:
-                self._json({"ok": False, "error": str(exc)})
-            return
-        if url.path == "/api/trash/empty":
-            self._json(api_trash_empty(self.session_id))
-            return
-        if url.path == "/api/move":
-            try:
-                self._json(api_move_file(body, self.session_id))
-            except ValueError as exc:
-                self._json({"ok": False, "error": str(exc)})
-            return
-        if url.path == "/api/reveal":
-            try:
-                self._json(api_reveal(body))
-            except Exception as exc:
-                self._json({"ok": False, "error": f"Open folder failed: {exc}"})
-            return
-        if url.path == "/api/prune-missing":
-            try:
-                self._json(api_prune_missing())
-            except Exception as exc:
-                self._json({"ok": False, "error": f"Prune failed: {exc}"})
-            return
-        if url.path not in ("/api/rename", "/api/reclassify"):
+        route = _POST_ROUTES.get(url.path)
+        if route is None:
             self._send(404, b"not found", "text/plain")
             return
+        handler, policy = route
         try:
-            if url.path == "/api/rename":
-                self._json(api_rename(body))
-            else:
-                self._json(api_reclassify(body))
-        except ValueError as exc:
-            self._json({"ok": False, "error": str(exc)})
-        except Exception as exc:  # surface unexpected errors to the UI
-            self._json({"ok": False, "error": f"Unexpected error: {exc}"})
+            result = handler(self, body)
+        except Exception as exc:
+            result = _wrap_post_error(exc, policy)
+        self._json(result)
 
     # -- file streaming ----------------------------------------------------------
 
