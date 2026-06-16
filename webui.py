@@ -22,6 +22,7 @@ from urllib.parse import urlparse, parse_qs
 import media_index as mi
 import scan_jobs
 import file_ops
+import index_query as iq
 
 DB_PATH = Path(__file__).parent / "media_index.db"
 PAGE_SIZE = 100
@@ -33,13 +34,6 @@ GROUP_FILE_CAP = 50
 # Set from CLI args in main(); the footer reads these to advertise the LAN URL.
 BIND_HOST = "127.0.0.1"
 BIND_PORT = 8765
-
-SORT_COLUMNS = {
-    "name": "name COLLATE NOCASE ASC",
-    "size": "size DESC",
-    "modified": "modified DESC",
-    "path": "path COLLATE NOCASE ASC",
-}
 
 ILLEGAL_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 GENERIC_DIRS = {
@@ -1836,113 +1830,47 @@ def get_file_row(fid):
     return row
 
 
-MEDIA_KINDS = ("video", "audio", "image")
-CATEGORY_VALUES = {"photo", "graphic",
-                   "text", "data", "word", "spreadsheet", "presentation", "pdf"}
+def _search_filters(params) -> iq.SearchFilters:
+    return iq.SearchFilters(
+        domain=params.get("domain", ["media"])[0],
+        q=params.get("q", [""])[0].strip(),
+        kind=params.get("kind", [""])[0],
+        source=params.get("source", [""])[0],
+        machine=params.get("machine", [""])[0],
+        year=params.get("year", [""])[0],
+    )
 
 
-def _domain_clause(params) -> str:
-    domain = params.get("domain", ["media"])[0]
-    if domain == "documents":
-        return "kind = 'document'"
-    return "kind IN ('video', 'audio', 'image')"
+def _page(params) -> int:
+    try:
+        return max(0, int(params.get("page", ["0"])[0]))
+    except ValueError:
+        return 0
 
 
 def api_stats(params):
-    dom = _domain_clause(params)
     conn = db()
-    sources = [
-        {"source": r["source"], "count": r["c"], "bytes": r["b"] or 0}
-        for r in conn.execute(
-            f"SELECT source, COUNT(*) c, SUM(size) b FROM files "
-            f"WHERE {dom} GROUP BY source")
-    ]
-    total, total_bytes = conn.execute(
-        f"SELECT COUNT(*), SUM(size) FROM files WHERE {dom}").fetchone()
-    years = [r[0] for r in conn.execute(
-        f"SELECT DISTINCT substr(modified,1,4) y FROM files "
-        f"WHERE {dom} AND modified != '' ORDER BY y DESC")]
-    categories = dict(conn.execute(
-        f"SELECT category, COUNT(*) FROM files "
-        f"WHERE {dom} AND category IS NOT NULL GROUP BY category"))
-    conn.close()
-    return {"sources": sources, "total": total, "bytes": total_bytes or 0,
-            "years": years, "categories": categories}
-
-
-def _build_where(params, exclude: str | None = None):
-    """WHERE clause from filter params, optionally ignoring one facet dimension."""
-    where, args = [_domain_clause(params)], []
-    q = params.get("q", [""])[0].strip()
-    kind = params.get("kind", [""])[0]
-    source = params.get("source", [""])[0]
-    machine = params.get("machine", [""])[0]
-    year = params.get("year", [""])[0]
-    if q:
-        where.append("(name LIKE ? OR path LIKE ?)")
-        args += [f"%{q}%", f"%{q}%"]
-    if exclude != "kind":
-        if kind in MEDIA_KINDS:
-            where.append("kind = ?")
-            args.append(kind)
-        elif kind in CATEGORY_VALUES:
-            where.append("category = ?")
-            args.append(kind)
-    if exclude != "source" and source in ("local", "onedrive", "gdrive", "qnap"):
-        where.append("source = ?")
-        args.append(source)
-    if exclude != "machine" and machine:
-        where.append("device_id = ?")
-        args.append(machine)
-    if exclude != "year" and year.isdigit() and len(year) == 4:
-        where.append("substr(modified,1,4) = ?")
-        args.append(year)
-    return " AND ".join(where), args
+    try:
+        return iq.stats(conn, params.get("domain", ["media"])[0])
+    finally:
+        conn.close()
 
 
 def api_facets(params):
-    """Valid options per filter, each computed with the *other* filters applied."""
     conn = db()
-    cond, args = _build_where(params, exclude="kind")
-    kinds = dict(conn.execute(
-        f"SELECT kind, COUNT(*) FROM files WHERE {cond} GROUP BY kind", args))
-    categories = dict(conn.execute(
-        f"SELECT category, COUNT(*) FROM files WHERE {cond} "
-        f"AND category IS NOT NULL GROUP BY category", args))
-    cond, args = _build_where(params, exclude="source")
-    sources = dict(conn.execute(
-        f"SELECT source, COUNT(*) FROM files WHERE {cond} GROUP BY source", args))
-    cond, args = _build_where(params, exclude="machine")
-    devices = [{"value": r[0], "label": r[1] or "Unknown machine", "count": r[2]}
-               for r in conn.execute(
-        f"SELECT device_id, device_label, COUNT(*) FROM files "
-        f"WHERE {cond} GROUP BY device_id, device_label ORDER BY device_label", args)]
-    cond, args = _build_where(params, exclude="year")
-    years = [{"value": r[0], "count": r[1]} for r in conn.execute(
-        f"SELECT substr(modified,1,4) y, COUNT(*) FROM files "
-        f"WHERE {cond} AND modified != '' GROUP BY y ORDER BY y DESC", args)]
-    conn.close()
-    return {"kinds": kinds, "categories": categories,
-            "sources": sources, "devices": devices, "years": years}
+    try:
+        return iq.facets(conn, _search_filters(params))
+    finally:
+        conn.close()
 
 
 def api_search(params):
-    sort = SORT_COLUMNS.get(params.get("sort", [""])[0], SORT_COLUMNS["modified"])
-    try:
-        page = max(0, int(params.get("page", ["0"])[0]))
-    except ValueError:
-        page = 0
-    cond, args = _build_where(params)
-
     conn = db()
-    total = conn.execute(f"SELECT COUNT(*) FROM files WHERE {cond}", args).fetchone()[0]
-    rows = [dict(r) for r in conn.execute(
-        f"SELECT id, source, device_id, device_label, path, name, ext, kind, size, modified, "
-        f"category, marked_delete "
-        f"FROM files WHERE {cond} ORDER BY {sort} LIMIT ? OFFSET ?",
-        args + [PAGE_SIZE, page * PAGE_SIZE])]
-    conn.close()
-    return {"total": total, "rows": rows, "page": page, "page_size": PAGE_SIZE}
+    try:
+        return iq.search(conn, _search_filters(params),
+                         params.get("sort", [""])[0], _page(params), PAGE_SIZE)
+    finally:
+        conn.close()
 
 
 # --- rename suggestions ---------------------------------------------------------
@@ -2085,261 +2013,51 @@ def api_rename(body):
 
 # --- duplicates -----------------------------------------------------------------
 
-DUP_MODES = {
-    # "name COLLATE NOCASE" groups case-insensitively like LOWER(name) but can
-    # use the idx_files_name_lower index, where LOWER(name) cannot.
-    "name": "name COLLATE NOCASE",
-    "meta": "meta_fingerprint",
-    "hash": "content_hash",
-}
-
-
-def _file_brief(row) -> dict:
-    return {
-        "id": row["id"], "source": row["source"], "name": row["name"],
-        "path": row["path"], "size": row["size"], "modified": row["modified"],
-        "content_hash": row["content_hash"], "meta_fingerprint": row["meta_fingerprint"],
-        "possible_dupe": row["possible_dupe"], "kind": row["kind"],
-    }
-
-
-def api_duplicates_summary():
-    conn = db()
-    mi.backfill_meta_fingerprints(conn)
-    total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    hashed = conn.execute(
-        "SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL AND content_hash != ''"
-    ).fetchone()[0]
-    groups = conn.execute(
-        "SELECT COUNT(*) FROM ("
-        "SELECT content_hash FROM files WHERE content_hash IS NOT NULL AND content_hash != '' "
-        "GROUP BY content_hash HAVING COUNT(*) > 1)"
-    ).fetchone()[0]
-    possible = conn.execute(
-        "SELECT COUNT(*) FROM files WHERE possible_dupe = 1").fetchone()[0]
-    conn.close()
-    return {"total": total, "hashed": hashed, "groups": groups, "possible": possible}
-
-
-REPORT_BUCKETS = [
-    ("≥ 1 GB", 1_000_000_000, None),
-    ("100 MB – 1 GB", 100_000_000, 1_000_000_000),
-    ("10 – 100 MB", 10_000_000, 100_000_000),
-    ("< 10 MB", 0, 10_000_000),
-]
-
-
-def api_duplicates_report(params):
-    """Exact-content-hash duplicate breakdown, optionally scoped to one source.
-    Reports group/redundant-copy counts, reclaimable bytes, size buckets, a
-    per-source rollup, and the biggest groups by reclaimable space."""
-    source = params.get("source", [""])[0]
-    if source not in ("local", "onedrive", "gdrive", "qnap"):
-        source = ""
-    conn = db()
-    hashed_clause = "content_hash IS NOT NULL AND content_hash != ''"
-    scope_clause = hashed_clause + (" AND source = ?" if source else "")
-    scope_args = [source] if source else []
-
-    files, ibytes = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(size),0) FROM files WHERE "
-        + (("source = ?") if source else "1=1"), scope_args).fetchone()
-    hashed = conn.execute(
-        f"SELECT COUNT(*) FROM files WHERE {scope_clause}", scope_args).fetchone()[0]
-
-    # Duplicate groups within scope (cross-source when no source is selected).
-    rows = conn.execute(
-        f"SELECT content_hash h, COUNT(*) c, MAX(size) sz FROM files "
-        f"WHERE {scope_clause} GROUP BY content_hash HAVING c > 1", scope_args).fetchall()
-
-    groups = len(rows)
-    redundant = sum(r["c"] - 1 for r in rows)
-    reclaim = sum((r["c"] - 1) * (r["sz"] or 0) for r in rows)
-
-    buckets = []
-    for label, lo, hi in REPORT_BUCKETS:
-        sel = [r for r in rows
-               if (r["sz"] or 0) >= lo and (hi is None or (r["sz"] or 0) < hi)]
-        buckets.append({
-            "label": label,
-            "groups": len(sel),
-            "copies": sum(r["c"] - 1 for r in sel),
-            "bytes": sum((r["c"] - 1) * (r["sz"] or 0) for r in sel),
-        })
-
-    top = sorted(rows, key=lambda r: (r["c"] - 1) * (r["sz"] or 0), reverse=True)[:25]
-    top_out = []
-    for r in top:
-        sample = conn.execute(
-            "SELECT id, name, path, source FROM files WHERE content_hash = ?"
-            + (" AND source = ?" if source else "") + " ORDER BY source, path LIMIT 1",
-            [r["h"]] + scope_args).fetchone()
-        if not sample:
-            continue
-        top_out.append({
-            "id": sample["id"], "name": sample["name"], "path": sample["path"],
-            "source": sample["source"], "count": r["c"], "each": r["sz"] or 0,
-            "waste": (r["c"] - 1) * (r["sz"] or 0),
-        })
-
-    # Per-source rollup: duplicate groups *within* each source.
-    per_rows = conn.execute(
-        f"SELECT source, content_hash, COUNT(*) c, MAX(size) sz FROM files "
-        f"WHERE {hashed_clause} GROUP BY source, content_hash HAVING c > 1").fetchall()
-    roll = {}
-    for r in per_rows:
-        d = roll.setdefault(r["source"], {"groups": 0, "copies": 0, "reclaim": 0})
-        d["groups"] += 1
-        d["copies"] += r["c"] - 1
-        d["reclaim"] += (r["c"] - 1) * (r["sz"] or 0)
-    counts = dict(conn.execute(
-        f"SELECT source, COUNT(*) FROM files WHERE {hashed_clause} GROUP BY source"))
-    per_source = []
-    for src in ("local", "onedrive", "gdrive", "qnap"):
-        if src not in counts and src not in roll:
-            continue
-        d = roll.get(src, {"groups": 0, "copies": 0, "reclaim": 0})
-        per_source.append({"source": src, "files": counts.get(src, 0), **d})
-
-    conn.close()
-    return {
-        "scope": source or "all", "files": files, "ibytes": ibytes, "hashed": hashed,
-        "groups": groups, "redundant": redundant, "reclaim": reclaim,
-        "buckets": buckets, "top": top_out, "per_source": per_source,
-    }
-
-
-def _dup_filters(params):
-    """Build extra WHERE conditions for the duplicate-group queries from the
-    filter params. Returns (sql_fragment, args); the fragment begins with
-    ' AND ...' so it can be appended to an existing WHERE."""
-    where, args = [], []
-    q = params.get("q", [""])[0].strip()
-    source = params.get("source", [""])[0]
-    possible = params.get("possible", [""])[0]
+def _dup_filters_from(params) -> iq.DupFilters:
     try:
         min_size = int(params.get("min_size", ["0"])[0])
     except ValueError:
         min_size = 0
-    if q:
-        where.append("(name LIKE ? OR path LIKE ?)")
-        args += [f"%{q}%", f"%{q}%"]
-    if source in ("local", "onedrive", "gdrive", "qnap"):
-        where.append("source = ?")
-        args.append(source)
-    if min_size > 0:
-        where.append("size >= ?")
-        args.append(min_size)
-    if possible == "1":
-        where.append("possible_dupe = 1")
-    frag = ("".join(f" AND {c}" for c in where))
-    return frag, args
+    return iq.DupFilters(
+        q=params.get("q", [""])[0].strip(),
+        source=params.get("source", [""])[0],
+        min_size=min_size,
+        possible=params.get("possible", [""])[0] == "1",
+    )
+
+
+def _limit(params) -> int:
+    try:
+        return min(100, max(1, int(params.get("limit", ["25"])[0])))
+    except ValueError:
+        return 25
+
+
+def api_duplicates_summary():
+    conn = db()
+    try:
+        return iq.duplicates_summary(conn)
+    finally:
+        conn.close()
+
+
+def api_duplicates_report(params):
+    conn = db()
+    try:
+        return iq.duplicates_report(conn, params.get("source", [""])[0])
+    finally:
+        conn.close()
 
 
 def api_duplicates(params):
-    mode = params.get("mode", ["name"])[0]
-    if mode not in DUP_MODES:
-        mode = "name"
-    key_expr = DUP_MODES[mode]
-    try:
-        page = max(0, int(params.get("page", ["0"])[0]))
-    except ValueError:
-        page = 0
-    try:
-        limit = min(100, max(1, int(params.get("limit", ["25"])[0])))
-    except ValueError:
-        limit = 25
-    file_id = params.get("file_id", [""])[0].strip()
-
     conn = db()
-    if mode == "meta":
-        mi.backfill_meta_fingerprints(conn)
-    anchor = None
-
-    if file_id:
-        row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
-        if not row:
-            conn.close()
-            return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit}
-        anchor = _file_brief(row)
-        if mode == "name":
-            key_val = row["name"].lower()
-            key_filter = f"{key_expr} = ?"
-            key_args = [key_val]
-        elif mode == "meta":
-            if not row["meta_fingerprint"]:
-                conn.close()
-                return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit, "anchor": anchor}
-            key_val = row["meta_fingerprint"]
-            key_filter = f"{key_expr} = ?"
-            key_args = [key_val]
-        else:
-            if not row["content_hash"]:
-                conn.close()
-                return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit, "anchor": anchor}
-            key_val = row["content_hash"]
-            key_filter = f"{key_expr} = ?"
-            key_args = [key_val]
-        files = [dict(r) for r in conn.execute(
-            f"SELECT * FROM files WHERE {key_filter} ORDER BY source, name", key_args)]
+    try:
+        return iq.duplicate_groups(
+            conn, params.get("mode", ["name"])[0], _dup_filters_from(params),
+            _page(params), _limit(params),
+            params.get("file_id", [""])[0].strip(), GROUP_FILE_CAP)
+    finally:
         conn.close()
-        if len(files) < 2:
-            return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit, "anchor": anchor}
-        label = key_val if mode != "name" else row["name"]
-        return {
-            "groups": [{
-                "key": key_val, "label": label, "count": len(files),
-                "files": [_file_brief(r) for r in files[:GROUP_FILE_CAP]],
-            }],
-            "total_groups": 1,
-            "page": 0,
-            "page_size": limit,
-            "anchor": anchor,
-        }
-
-    null_guard = f"{key_expr} IS NOT NULL AND {key_expr} != ''"
-    if mode == "name":
-        null_guard = f"{key_expr} IS NOT NULL"
-
-    frag, frag_args = _dup_filters(params)
-    where_full = null_guard + frag
-
-    total_groups = conn.execute(
-        f"SELECT COUNT(*) FROM ("
-        f"SELECT {key_expr} k FROM files WHERE {where_full} "
-        f"GROUP BY k HAVING COUNT(*) > 1)", frag_args
-    ).fetchone()[0]
-
-    key_rows = conn.execute(
-        f"SELECT k, c FROM ("
-        f"SELECT {key_expr} k, COUNT(*) c FROM files WHERE {where_full} "
-        f"GROUP BY k HAVING c > 1) ORDER BY c DESC, k LIMIT ? OFFSET ?",
-        frag_args + [limit, page * limit]).fetchall()
-
-    groups = []
-    for key_val, count in key_rows:
-        # Fetch only the capped slice, not every row in the group; the true
-        # total comes from the grouped count above. Groups can be huge
-        # (thousands of identical files), so this avoids a heavy fetchall and
-        # the resulting oversized payload.
-        rows = conn.execute(
-            f"SELECT * FROM files WHERE {key_expr} = ?{frag} ORDER BY source, name LIMIT ?",
-            [key_val] + frag_args + [GROUP_FILE_CAP]).fetchall()
-        label = rows[0]["name"] if (mode == "name" and rows) else key_val
-        groups.append({
-            "key": key_val,
-            "label": label,
-            "count": count,
-            "files": [_file_brief(r) for r in rows],
-        })
-    conn.close()
-    return {
-        "groups": groups,
-        "total_groups": total_groups,
-        "page": page,
-        "page_size": limit,
-        "anchor": anchor,
-    }
 
 
 def api_scan_start(body):
