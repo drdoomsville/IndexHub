@@ -22,7 +22,6 @@ from urllib.parse import urlparse, parse_qs
 import media_index as mi
 import scan_jobs
 import file_ops
-import index_query as iq
 
 DB_PATH = Path(__file__).parent / "media_index.db"
 PAGE_SIZE = 100
@@ -34,6 +33,13 @@ GROUP_FILE_CAP = 50
 # Set from CLI args in main(); the footer reads these to advertise the LAN URL.
 BIND_HOST = "127.0.0.1"
 BIND_PORT = 8765
+
+SORT_COLUMNS = {
+    "name": "name COLLATE NOCASE ASC",
+    "size": "size DESC",
+    "modified": "modified DESC",
+    "path": "path COLLATE NOCASE ASC",
+}
 
 ILLEGAL_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 GENERIC_DIRS = {
@@ -49,25 +55,28 @@ APP_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__ Index</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0f1115; --panel: #181b22; --panel2: #1f2330;
-    --text: #e6e9f0; --muted: #8b93a7; --accent: #5b8cff;
+    --bg: #0b0d11; --panel: #15181f; --panel2: #1c2029;
+    --text: #e8ebf1; --muted: #8a92a3; --accent: #6c8cff;
     --video: #ff7b72; --audio: #d2a8ff; --image: #56d364;
+    --border: #232834; --border2: #2b313d;
   }
   * { box-sizing: border-box; margin: 0; }
   body { background: var(--bg); color: var(--text);
-         font: 14px/1.5 "Segoe UI", system-ui, sans-serif; }
+         font: 14px/1.5 'IBM Plex Sans', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
   .wrap { max-width: 1500px; margin: 0 auto; padding: 24px 20px 60px; }
-  h1 { font-size: 22px; font-weight: 600; letter-spacing: .3px; }
+  h1 { font-size: 22px; font-weight: 700; letter-spacing: -.01em; }
   h1 span { color: var(--accent); }
-  .sub { color: var(--muted); margin: 2px 0 20px; font-size: 13px; }
+  .sub { color: var(--muted); margin: 4px 0 20px; font-size: 12.5px; font-family: 'IBM Plex Mono', Consolas, monospace; }
   .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
-  .card { background: var(--panel); border: 1px solid #262b38; border-radius: 10px;
-          padding: 12px 18px; min-width: 150px; }
-  .card .num { font-size: 20px; font-weight: 600; }
-  .card .lbl { color: var(--muted); font-size: 12px; text-transform: uppercase;
-               letter-spacing: .6px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+          padding: 14px 18px; min-width: 150px; }
+  .card .num { font-size: 20px; font-weight: 600; letter-spacing: -.01em; }
+  .card .lbl { color: var(--muted); font-size: 11.5px; font-family: 'IBM Plex Mono', Consolas, monospace; }
   .controls { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
   .controls-search input { width: 100%; box-sizing: border-box; }
   .controls-filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
@@ -76,18 +85,18 @@ APP_HTML = """<!DOCTYPE html>
   #resetBtn { border-color: #3d4458; color: var(--muted); flex: 0 0 auto; }
   #resetBtn:hover { color: var(--text); border-color: var(--accent); }
   input, select { background: var(--panel2); color: var(--text);
-    border: 1px solid #2c3344; border-radius: 8px; padding: 9px 12px;
-    font-size: 14px; outline: none; }
-  input:focus, select:focus { border-color: var(--accent); }
+    border: 1px solid var(--border2); border-radius: 9px; padding: 9px 12px;
+    font-size: 14px; font-family: inherit; outline: none; }
+  input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(108,140,255,.1); }
   .content { display: flex; gap: 16px; align-items: flex-start; }
   .results { flex: 1; min-width: 0; }
   /* Fixed layout makes the table fill its container and lets every cell
      truncate to a single line with an ellipsis. */
   table { width: 100%; table-layout: fixed; border-collapse: collapse; background: var(--panel);
-          border: 1px solid #262b38; border-radius: 10px; overflow: hidden; }
-  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #232836;
+          border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #1c2029;
            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  td.path { color: var(--muted); font-family: Consolas, monospace; font-size: 12.5px; }
+  td.path { color: var(--muted); font-family: 'IBM Plex Mono', Consolas, monospace; font-size: 12px; }
   /* Column widths (sum ~100%); Name and Path take the flexible share. */
   th:nth-child(1), td:nth-child(1) { width: 23%; }
   th:nth-child(2), td:nth-child(2) { width: 8%; }
@@ -96,11 +105,11 @@ APP_HTML = """<!DOCTYPE html>
   th:nth-child(5), td:nth-child(5) { width: 8%; }
   th:nth-child(6), td:nth-child(6) { width: 10%; }
   th:nth-child(7), td:nth-child(7) { width: 30%; }
-  th { background: var(--panel2); color: var(--muted); font-size: 12px;
-       text-transform: uppercase; letter-spacing: .5px; position: sticky; top: 0; }
+  th { background: var(--panel2); color: var(--muted); font-size: 11px;
+       text-transform: uppercase; letter-spacing: .6px; position: sticky; top: 0; font-family: 'IBM Plex Sans', system-ui, sans-serif; }
   tbody tr { cursor: pointer; }
-  tr:hover td { background: #1d2230; }
-  tr.sel td { background: #233252 !important; }
+  tr:hover td { background: #1a1f2b; }
+  tr.sel td { background: rgba(108,140,255,.12) !important; box-shadow: inset 3px 0 0 var(--accent); }
   tr.marked td { opacity: .72; }
   tr.marked td:first-child { text-decoration: line-through; color: var(--video); }
   .trash-bar { position: fixed; left: 0; right: 0; bottom: 0; background: #1a1520;
@@ -122,60 +131,61 @@ APP_HTML = """<!DOCTYPE html>
   .renlbl { margin-top: 4px; }
   .mark-row { display: flex; align-items: center; gap: 8px; margin: 10px 0; font-size: 13px; }
   .mark-row input { width: auto; }
-  .btn-danger { border-color: #7a3040 !important; color: #ff9cab !important; }
-  .btn-danger:hover { border-color: var(--video) !important; color: var(--video) !important; }
+  .btn-danger { border-color: rgba(255,123,114,.4) !important; color: #ff9cab !important; background: rgba(255,123,114,.08) !important; }
+  .btn-danger:hover { border-color: var(--video) !important; color: var(--video) !important; background: rgba(255,123,114,.15) !important; }
   body.has-trash { padding-bottom: 120px; }
-  .badge { display: inline-block; padding: 1px 9px; border-radius: 99px;
-           font-size: 11.5px; font-weight: 600; }
-  .badge.video { background: #3d1d1d; color: var(--video); }
-  .badge.audio { background: #2d2240; color: var(--audio); }
-  .badge.image, .badge.photo { background: #16301c; color: var(--image); }
-  .badge.graphic { background: #1d2c45; color: #79b8ff; }
-  .badge.text { background: #2a2a33; color: #c9d1d9; }
-  .badge.data { background: #15302e; color: #4dd4c2; }
-  .badge.word { background: #1d2c45; color: #79b8ff; }
-  .badge.spreadsheet { background: #16301c; color: var(--image); }
-  .badge.presentation { background: #3a2a14; color: #f0a45d; }
-  .badge.pdf { background: #3d1d1d; color: var(--video); }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 99px;
+           font-size: 11px; font-weight: 600; font-family: 'IBM Plex Mono', Consolas, monospace; }
+  .badge.video { background: rgba(255,123,114,.13); color: var(--video); }
+  .badge.audio { background: rgba(210,168,255,.13); color: var(--audio); }
+  .badge.image, .badge.photo { background: rgba(86,211,100,.13); color: var(--image); }
+  .badge.graphic { background: rgba(121,184,255,.13); color: #79b8ff; }
+  .badge.text { background: rgba(201,209,217,.08); color: #c9d1d9; }
+  .badge.data { background: rgba(77,212,194,.1); color: #4dd4c2; }
+  .badge.word { background: rgba(121,184,255,.13); color: #79b8ff; }
+  .badge.spreadsheet { background: rgba(86,211,100,.13); color: var(--image); }
+  .badge.presentation { background: rgba(240,164,93,.12); color: #f0a45d; }
+  .badge.pdf { background: rgba(255,123,114,.13); color: var(--video); }
   .topnav { margin-bottom: 6px; }
   .topnav a { color: var(--muted); text-decoration: none; font-size: 13px; }
   .topnav a:hover { color: var(--accent); }
   pre.textprev { white-space: pre-wrap; max-height: 300px; overflow: auto;
-    background: var(--panel2); padding: 10px; border-radius: 8px; margin: 12px 0;
-    font: 12px/1.5 Consolas, monospace; color: var(--text); word-break: break-all; }
+    background: var(--panel2); padding: 10px; border-radius: 9px; margin: 12px 0;
+    font: 12px/1.5 'IBM Plex Mono', Consolas, monospace; color: var(--text); word-break: break-all; }
   iframe.preview { height: 380px; border: none; }
-  .src { color: var(--muted); font-size: 12.5px; }
+  .src { color: var(--muted); font-size: 12.5px; font-family: 'IBM Plex Mono', Consolas, monospace; }
   .pager { display: flex; gap: 10px; align-items: center; margin-top: 14px;
            color: var(--muted); }
-  button { background: var(--panel2); color: var(--text); border: 1px solid #2c3344;
-           border-radius: 8px; padding: 7px 16px; cursor: pointer; font-size: 13.5px; }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--border2);
+           border-radius: 9px; padding: 7px 16px; cursor: pointer; font-size: 13.5px; font-family: inherit; }
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: .4; cursor: default; }
   .empty { padding: 40px; text-align: center; color: var(--muted); }
   .panel { width: 380px; flex-shrink: 0; background: var(--panel);
-           border: 1px solid #262b38; border-radius: 10px; padding: 16px;
+           border: 1px solid var(--border); border-radius: 12px; padding: 16px;
            position: sticky; top: 16px; display: none; }
   .panel.open { display: block; }
   .panel .close { float: right; padding: 2px 10px; font-size: 13px; }
-  .panel h2 { font-size: 15px; word-break: break-all; padding-right: 40px; }
+  .panel h2 { font-size: 15px; font-weight: 600; word-break: break-all; padding-right: 40px; }
   .preview { width: 100%; max-height: 300px; object-fit: contain;
              border-radius: 8px; background: #000; margin: 12px 0; display: block; }
   audio.preview { height: 44px; background: transparent; }
   .noprev { padding: 36px 10px; text-align: center; color: var(--muted);
-            background: var(--panel2); border-radius: 8px; margin: 12px 0; }
+            background: var(--panel2); border-radius: 10px; margin: 12px 0; }
   .meta { color: var(--muted); font-size: 12.5px; line-height: 1.8;
-          word-break: break-all; margin-bottom: 12px; }
+          word-break: break-all; margin-bottom: 12px; font-family: 'IBM Plex Mono', Consolas, monospace; }
   .meta b { color: var(--text); font-weight: 600; }
-  .renlbl { font-size: 12px; color: var(--muted); text-transform: uppercase;
-            letter-spacing: .5px; margin: 14px 0 6px; }
+  .renlbl { font-size: 11px; color: var(--muted); text-transform: uppercase;
+            letter-spacing: .6px; font-weight: 600; margin: 14px 0 6px; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-  .chip { background: var(--panel2); border: 1px solid #2c3344; border-radius: 99px;
-          padding: 4px 11px; font-size: 12px; cursor: pointer; word-break: break-all; }
+  .chip { background: var(--panel2); border: 1px solid var(--border2); border-radius: 99px;
+          padding: 4px 11px; font-size: 12px; cursor: pointer; word-break: break-all; font-family: 'IBM Plex Mono', Consolas, monospace; }
   .chip:hover { border-color: var(--accent); color: var(--accent); }
-  #newname { width: 100%; margin-bottom: 8px; font-family: Consolas, monospace;
+  #newname { width: 100%; margin-bottom: 8px; font-family: 'IBM Plex Mono', Consolas, monospace;
              font-size: 13px; }
   #renameBtn { width: 100%; background: var(--accent); border: none;
-               color: #fff; font-weight: 600; }
+               color: #fff; font-weight: 600; box-shadow: 0 3px 10px rgba(108,140,255,.25); }
+  #renameBtn:hover:not(:disabled) { filter: brightness(1.1); }
   #renamemsg { font-size: 12.5px; margin-top: 8px; min-height: 18px; }
   #renamemsg.ok { color: var(--image); }
   #renamemsg.err { color: var(--video); }
@@ -705,24 +715,27 @@ LANDING_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>File Index Hub</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --bg: #0f1115; --panel: #181b22; --panel2: #1f2330; --text: #e6e9f0;
-          --muted: #8b93a7; --accent: #5b8cff; }
+  :root { --bg: #0b0d11; --panel: #15181f; --panel2: #1c2029; --text: #e8ebf1;
+          --muted: #8a92a3; --accent: #6c8cff; --border: #232834; --border2: #2b313d; }
   * { box-sizing: border-box; margin: 0; }
-  body { background: var(--bg); color: var(--text);
-         font: 14px/1.5 "Segoe UI", system-ui, sans-serif; }
+  body { background: radial-gradient(1200px 600px at 70% -5%, rgba(108,140,255,.07), transparent 55%), var(--bg);
+         color: var(--text); font: 14px/1.5 'IBM Plex Sans', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
   .wrap { max-width: 900px; margin: 0 auto; padding: 60px 20px; }
-  h1 { font-size: 28px; font-weight: 600; }
+  h1 { font-size: 30px; font-weight: 700; letter-spacing: -.02em; }
   h1 span { color: var(--accent); }
-  .sub { color: var(--muted); margin: 4px 0 36px; }
+  .sub { color: var(--muted); margin: 8px 0 36px; font-size: 14.5px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
           gap: 20px; }
-  a.bigcard { display: block; background: var(--panel); border: 1px solid #262b38;
-    border-radius: 14px; padding: 26px; text-decoration: none; color: var(--text);
-    transition: border-color .15s, transform .15s; }
-  a.bigcard:hover { border-color: var(--accent); transform: translateY(-2px); }
+  a.bigcard { display: block; background: linear-gradient(180deg, var(--panel), #13161c); border: 1px solid var(--border);
+    border-radius: 16px; padding: 26px; text-decoration: none; color: var(--text);
+    transition: border-color .15s, transform .15s, box-shadow .15s; }
+  a.bigcard:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,.35); }
   .icon { font-size: 34px; margin-bottom: 10px; }
-  .bigcard h2 { font-size: 19px; margin-bottom: 4px; }
+  .bigcard h2 { font-size: 18px; font-weight: 600; letter-spacing: -.01em; margin-bottom: 4px; }
   .bigcard .desc { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
   .stats { font-size: 14px; color: var(--muted); line-height: 1.9; }
   .stats b { color: var(--text); font-size: 17px; }
@@ -731,19 +744,21 @@ LANDING_HTML = """<!DOCTYPE html>
   .topnav { margin-bottom: 18px; }
   .topnav a { color: var(--muted); text-decoration: none; font-size: 13px; margin-right: 8px; }
   .topnav a:hover { color: var(--accent); }
-  .scan-panel { background: var(--panel); border: 1px solid #262b38; border-radius: 14px;
-    padding: 22px 26px; margin-top: 28px; }
-  .scan-panel h2 { font-size: 17px; margin-bottom: 12px; }
+  .scan-panel { background: linear-gradient(180deg, var(--panel), #13161c); border: 1px solid var(--border); border-radius: 16px;
+    padding: 22px 26px; margin-top: 24px; }
+  .scan-panel h2 { font-size: 16px; font-weight: 600; letter-spacing: -.01em; margin-bottom: 14px; }
   .scan-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
   .scan-row select, .scan-row input { background: var(--panel2); color: var(--text);
-    border: 1px solid #2c3344; border-radius: 8px; padding: 9px 12px; font-size: 14px; }
+    border: 1px solid var(--border2); border-radius: 9px; padding: 9px 12px; font-size: 13.5px; font-family: inherit; outline: none; }
+  .scan-row select:focus, .scan-row input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(108,140,255,.1); }
   .scan-row input { flex: 1; min-width: 220px; }
-  .scan-row button { background: var(--panel2); color: var(--text); border: 1px solid #2c3344;
-    border-radius: 8px; padding: 9px 16px; cursor: pointer; font-size: 13.5px; }
-  .scan-row button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .scan-row button { background: var(--panel2); color: var(--text); border: 1px solid var(--border2);
+    border-radius: 9px; padding: 9px 16px; cursor: pointer; font-size: 13.5px; font-family: inherit; }
+  .scan-row button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; box-shadow: 0 3px 12px rgba(108,140,255,.25); }
+  .scan-row button.primary:hover:not(:disabled) { filter: brightness(1.08); }
   .scan-row button:hover:not(:disabled) { border-color: var(--accent); }
   .scan-row button:disabled { opacity: .45; cursor: default; }
-  #scanStatus { color: var(--muted); font-size: 13px; line-height: 1.7; min-height: 40px; }
+  #scanStatus { color: var(--muted); font-size: 13px; line-height: 1.7; min-height: 40px; font-family: 'IBM Plex Mono', Consolas, monospace; }
   #scanStatus.running { color: var(--text); }
   label.chk { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
 </style>
@@ -913,44 +928,47 @@ DUPS_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Duplicate Checker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#0f1115; --panel:#181b22; --panel2:#1f2330; --text:#e6e9f0; --muted:#8b93a7; --accent:#5b8cff; --good:#46c08a; }
+  :root { --bg:#0b0d11; --panel:#15181f; --panel2:#1c2029; --text:#e8ebf1; --muted:#8a92a3; --accent:#6c8cff; --good:#46c08a; --border:#232834; --border2:#2b313d; }
   * { box-sizing:border-box; margin:0; }
-  body { background:var(--bg); color:var(--text); font:14px/1.5 "Segoe UI", system-ui, sans-serif; }
+  body { background:var(--bg); color:var(--text); font:14px/1.5 'IBM Plex Sans', system-ui, sans-serif; -webkit-font-smoothing:antialiased; }
   .wrap { max-width:1200px; margin:0 auto; padding:24px 20px 60px; }
-  h1 { font-size:22px; font-weight:600; }
+  h1 { font-size:22px; font-weight:700; letter-spacing:-.01em; }
   h1 span { color:var(--accent); }
   .sub { color:var(--muted); margin:4px 0 18px; font-size:13px; }
   .topnav { margin-bottom:10px; }
   .topnav a { color:var(--muted); text-decoration:none; font-size:13px; margin-right:8px; }
   .topnav a:hover { color:var(--accent); }
   .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
-  .tabs button { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px;
-    padding:8px 14px; cursor:pointer; font-size:13px; }
-  .tabs button.active { border-color:var(--accent); color:var(--accent); }
-  .group { background:var(--panel); border:1px solid #262b38; border-radius:10px; margin-bottom:14px; overflow:hidden; }
+  .tabs button { background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:9px;
+    padding:8px 14px; cursor:pointer; font-size:13px; font-family:inherit; }
+  .tabs button.active { border-color:var(--accent); color:var(--accent); background:rgba(108,140,255,.1); }
+  .group { background:var(--panel); border:1px solid var(--border); border-radius:12px; margin-bottom:14px; overflow:hidden; }
   .group-h { padding:10px 14px; background:var(--panel2); font-size:13px; color:var(--muted); word-break:break-all; }
   .group-h b { color:var(--text); }
   table { width:100%; border-collapse:collapse; }
   th, td { text-align:left; padding:8px 12px; border-top:1px solid #232836; font-size:13px; }
   th { color:var(--muted); font-size:11px; text-transform:uppercase; }
-  td.path { color:var(--muted); font-family:Consolas,monospace; font-size:12px; word-break:break-all; white-space:normal; }
+  td.path { color:var(--muted); font-family:'IBM Plex Mono',Consolas,monospace; font-size:12px; word-break:break-all; white-space:normal; }
   .empty { padding:40px; text-align:center; color:var(--muted); }
   .more-row { color:var(--muted); font-size:12px; font-style:italic; }
   .pager { display:flex; gap:10px; align-items:center; margin-top:14px; color:var(--muted); }
-  button { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px;
-    padding:7px 16px; cursor:pointer; font-size:13.5px; }
+  button { background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:9px;
+    padding:7px 16px; cursor:pointer; font-size:13.5px; font-family:inherit; }
   button:hover:not(:disabled) { border-color:var(--accent); }
   button:disabled { opacity:.4; cursor:default; }
-  .anchor { background:#233252; border:1px solid #3a5080; border-radius:8px; padding:10px 14px; margin-bottom:14px; font-size:13px; }
+  .anchor { background:rgba(108,140,255,.1); border:1px solid rgba(108,140,255,.3); border-radius:10px; padding:10px 14px; margin-bottom:14px; font-size:13px; }
   .flag { background:#4a3520; color:#f0b35e; border-radius:6px; padding:1px 7px; font-size:11px; white-space:nowrap; }
   .filters { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }
   .filters input[type=text], .filters select { background:var(--panel2); color:var(--text);
-    border:1px solid #2c3344; border-radius:8px; padding:7px 10px; font-size:13px; }
+    border:1px solid var(--border2); border-radius:9px; padding:7px 10px; font-size:13px; font-family:inherit; outline:none; }
   .filters input[type=text] { min-width:220px; flex:1 1 220px; }
   .filters label { color:var(--muted); font-size:13px; display:flex; align-items:center; gap:6px; }
-  .reveal-btn { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:7px;
-    padding:4px 10px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  .reveal-btn { background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:8px;
+    padding:4px 10px; font-size:12px; cursor:pointer; white-space:nowrap; font-family:inherit; }
   .reveal-btn:hover { border-color:var(--accent); color:var(--accent); }
   .reveal-btn:disabled { opacity:.5; cursor:default; }
   .del-btn { background:#3a2330; color:#f0859e; border:1px solid #5a3344; border-radius:7px;
@@ -960,7 +978,7 @@ DUPS_HTML = """<!DOCTYPE html>
   .lib-link { color:var(--accent); text-decoration:none; font-size:12px; white-space:nowrap; padding:4px 4px; }
   .lib-link:hover { text-decoration:underline; }
   .acts { display:flex; gap:6px; justify-content:flex-end; align-items:center; flex-wrap:wrap; }
-  .trash-bar { position:fixed; bottom:0; left:0; right:0; background:#1a1d26; border-top:1px solid #2c3344;
+  .trash-bar { position:fixed; bottom:0; left:0; right:0; background:#0f1217; border-top:1px solid var(--border);
     padding:10px 18px; max-height:45vh; box-shadow:0 -4px 14px rgba(0,0,0,.4);
     display:flex; flex-direction:column; }
   .trash-bar h3 { font-size:13px; color:#46c08a; margin-bottom:6px; font-weight:600; flex:0 0 auto; }
@@ -971,39 +989,39 @@ DUPS_HTML = """<!DOCTYPE html>
   #trashToggle:hover { text-decoration:underline; }
   .trash-item { display:flex; gap:10px; align-items:center; font-size:12.5px; padding:3px 0; }
   .trash-item .nm { color:var(--text); }
-  .trash-item .meta { color:var(--muted); font-family:Consolas,monospace; font-size:11px; word-break:break-all; flex:1; }
+  .trash-item .meta { color:var(--muted); font-family:'IBM Plex Mono',Consolas,monospace; font-size:11px; word-break:break-all; flex:1; }
   body.has-trash .wrap { padding-bottom:36vh; }
   .batch-toggle.active { border-color:var(--accent); color:var(--accent); }
   .batchbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:14px;
-    background:var(--panel); border:1px solid #2c3344; border-radius:10px; padding:10px 12px; }
-  .batchbar select { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px; padding:7px 10px; font-size:13px; }
+    background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:10px 12px; }
+  .batchbar select { background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:9px; padding:7px 10px; font-size:13px; font-family:inherit; }
   .selinfo { color:var(--muted); font-size:13px; margin-left:auto; }
   .selinfo b { color:var(--text); }
   td.cb, th.cb { width:34px; text-align:center; }
   td.cb input { width:16px; height:16px; cursor:pointer; }
   /* Top-level view switcher (Checker vs. Overview) */
-  .viewtabs { display:flex; gap:4px; margin-bottom:16px; border-bottom:1px solid #262b38; }
+  .viewtabs { display:flex; gap:4px; margin-bottom:16px; border-bottom:1px solid var(--border); }
   .viewtabs button { background:none; border:none; border-bottom:2px solid transparent; color:var(--muted);
     padding:9px 16px; cursor:pointer; font-size:14px; border-radius:0; }
   .viewtabs button:hover:not(:disabled) { color:var(--text); border-color:transparent; }
-  .viewtabs button.active { color:var(--accent); border-bottom-color:var(--accent); }
+  .viewtabs button.active { color:var(--accent); border-bottom-color:var(--accent); font-weight:600; }
   /* Overview tab (merged duplicate report), scoped so it can't clash with the checker */
   #view-overview h2 { font-size:15px; font-weight:600; margin:26px 0 10px; color:var(--text); }
   #view-overview h2.collapsible { cursor:pointer; user-select:none; }
   #view-overview h2.collapsible::before { content:"\\25be "; color:var(--muted); font-size:12px; }
   #view-overview h2.collapsible.collapsed::before { content:"\\25b8 "; }
   #view-overview .controls { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
-  #view-overview select { background:var(--panel2); color:var(--text); border:1px solid #2c3344; border-radius:8px; padding:7px 10px; font-size:13px; }
+  #view-overview select { background:var(--panel2); color:var(--text); border:1px solid var(--border2); border-radius:9px; padding:7px 10px; font-size:13px; font-family:inherit; }
   #view-overview .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:6px; }
-  #view-overview .card { background:var(--panel); border:1px solid #262b38; border-radius:12px; padding:14px 16px; }
+  #view-overview .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
   #view-overview .card .num { font-size:24px; font-weight:700; }
   #view-overview .card .num.hl { color:var(--good); }
   #view-overview .card .lbl { color:var(--muted); font-size:12px; margin-top:2px; }
-  #view-overview table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid #262b38; border-radius:10px; overflow:hidden; }
+  #view-overview table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--border); border-radius:12px; overflow:hidden; }
   #view-overview th, #view-overview td { text-align:left; padding:9px 12px; border-top:1px solid #232836; font-size:13px; }
   #view-overview th { color:var(--muted); font-size:11px; text-transform:uppercase; border-top:none; background:var(--panel2); }
   #view-overview td.num, #view-overview th.num { text-align:right; font-variant-numeric:tabular-nums; }
-  #view-overview tr.clickable:hover { background:#1c2433; cursor:pointer; }
+  #view-overview tr.clickable:hover { background:#1a1f2b; cursor:pointer; }
   #view-overview .bar { height:7px; background:var(--panel2); border-radius:4px; overflow:hidden; margin-top:4px; }
   #view-overview .bar > i { display:block; height:100%; background:var(--accent); }
   #view-overview .src { display:inline-block; font-size:11px; color:var(--muted); }
@@ -1450,20 +1468,23 @@ MEDIAORG_HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Media Org</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#15171c; --card:#1e2128; --text:#e8eaed; --muted:#9aa0a6; --accent:#7aa2f7; --line:#2a2e37; }
+  :root { --bg:#0b0d11; --card:#15181f; --text:#e8ebf1; --muted:#8a92a3; --accent:#6c8cff; --line:#232834; }
   * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,Segoe UI,Arial; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 'IBM Plex Sans',system-ui,Arial; -webkit-font-smoothing:antialiased; }
   .wrap { max-width:860px; margin:0 auto; padding:24px 20px 80px; }
   .topnav { color:var(--muted); font-size:13px; margin-bottom:14px; }
   .topnav a { color:var(--accent); text-decoration:none; }
-  h1 { font-size:26px; margin:0 0 4px; } h1 span { color:var(--accent); }
+  h1 { font-size:26px; font-weight:700; letter-spacing:-.01em; margin:0 0 4px; } h1 span { color:var(--accent); }
   .sub { color:var(--muted); margin-bottom:20px; }
-  .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; margin-bottom:18px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; margin-bottom:18px; }
   label.src { display:block; padding:8px 10px; border:1px solid var(--line); border-radius:8px; margin-bottom:8px; cursor:pointer; }
   label.src:hover { border-color:var(--accent); }
-  button { background:#272b34; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 16px; font-size:14px; cursor:pointer; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#10131a; font-weight:600; }
+  button { background:#272b34; color:var(--text); border:1px solid var(--line); border-radius:9px; padding:8px 16px; font-size:14px; cursor:pointer; font-family:inherit; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; box-shadow:0 3px 10px rgba(108,140,255,.25); }
   button:disabled { opacity:.45; cursor:default; }
   #preview, #progress { color:var(--muted); margin-top:12px; min-height:20px; font-size:14px; }
   #progress.active { color:var(--text); }
@@ -1687,7 +1708,7 @@ def lan_ip() -> str | None:
 
 def footer_html() -> str:
     """Footer shown on every page; advertises the LAN URL when bound wide."""
-    link = "color:#5b8cff;text-decoration:none"
+    link = "color:#6c8cff;text-decoration:none"
     local = f"http://localhost:{BIND_PORT}"
     parts = [f'<a style="{link}" href="{local}">{local}</a>']
     if BIND_HOST not in ("127.0.0.1", "localhost"):
@@ -1697,8 +1718,8 @@ def footer_html() -> str:
             parts.append(f'LAN: <a style="{link}" href="{lan}">{lan}</a>')
     return (
         '<footer style="max-width:1500px;margin:32px auto 0;padding:16px 20px;'
-        "border-top:1px solid #262b38;color:#8b93a7;font-size:12.5px;"
-        'text-align:center">File <span style="color:#5b8cff">Index</span> Hub'
+        "border-top:1px solid #232834;color:#8a92a3;font-size:12.5px;font-family:\'IBM Plex Sans\',system-ui,sans-serif;"
+        'text-align:center">File <span style="color:#6c8cff">Index</span> Hub'
         " &middot; " + " &middot; ".join(parts) + "</footer>"
     )
 
@@ -1830,47 +1851,113 @@ def get_file_row(fid):
     return row
 
 
-def _search_filters(params) -> iq.SearchFilters:
-    return iq.SearchFilters(
-        domain=params.get("domain", ["media"])[0],
-        q=params.get("q", [""])[0].strip(),
-        kind=params.get("kind", [""])[0],
-        source=params.get("source", [""])[0],
-        machine=params.get("machine", [""])[0],
-        year=params.get("year", [""])[0],
-    )
+MEDIA_KINDS = ("video", "audio", "image")
+CATEGORY_VALUES = {"photo", "graphic",
+                   "text", "data", "word", "spreadsheet", "presentation", "pdf"}
 
 
-def _page(params) -> int:
-    try:
-        return max(0, int(params.get("page", ["0"])[0]))
-    except ValueError:
-        return 0
+def _domain_clause(params) -> str:
+    domain = params.get("domain", ["media"])[0]
+    if domain == "documents":
+        return "kind = 'document'"
+    return "kind IN ('video', 'audio', 'image')"
 
 
 def api_stats(params):
+    dom = _domain_clause(params)
     conn = db()
-    try:
-        return iq.stats(conn, params.get("domain", ["media"])[0])
-    finally:
-        conn.close()
+    sources = [
+        {"source": r["source"], "count": r["c"], "bytes": r["b"] or 0}
+        for r in conn.execute(
+            f"SELECT source, COUNT(*) c, SUM(size) b FROM files "
+            f"WHERE {dom} GROUP BY source")
+    ]
+    total, total_bytes = conn.execute(
+        f"SELECT COUNT(*), SUM(size) FROM files WHERE {dom}").fetchone()
+    years = [r[0] for r in conn.execute(
+        f"SELECT DISTINCT substr(modified,1,4) y FROM files "
+        f"WHERE {dom} AND modified != '' ORDER BY y DESC")]
+    categories = dict(conn.execute(
+        f"SELECT category, COUNT(*) FROM files "
+        f"WHERE {dom} AND category IS NOT NULL GROUP BY category"))
+    conn.close()
+    return {"sources": sources, "total": total, "bytes": total_bytes or 0,
+            "years": years, "categories": categories}
+
+
+def _build_where(params, exclude: str | None = None):
+    """WHERE clause from filter params, optionally ignoring one facet dimension."""
+    where, args = [_domain_clause(params)], []
+    q = params.get("q", [""])[0].strip()
+    kind = params.get("kind", [""])[0]
+    source = params.get("source", [""])[0]
+    machine = params.get("machine", [""])[0]
+    year = params.get("year", [""])[0]
+    if q:
+        where.append("(name LIKE ? OR path LIKE ?)")
+        args += [f"%{q}%", f"%{q}%"]
+    if exclude != "kind":
+        if kind in MEDIA_KINDS:
+            where.append("kind = ?")
+            args.append(kind)
+        elif kind in CATEGORY_VALUES:
+            where.append("category = ?")
+            args.append(kind)
+    if exclude != "source" and source in ("local", "onedrive", "gdrive", "qnap"):
+        where.append("source = ?")
+        args.append(source)
+    if exclude != "machine" and machine:
+        where.append("device_id = ?")
+        args.append(machine)
+    if exclude != "year" and year.isdigit() and len(year) == 4:
+        where.append("substr(modified,1,4) = ?")
+        args.append(year)
+    return " AND ".join(where), args
 
 
 def api_facets(params):
+    """Valid options per filter, each computed with the *other* filters applied."""
     conn = db()
-    try:
-        return iq.facets(conn, _search_filters(params))
-    finally:
-        conn.close()
+    cond, args = _build_where(params, exclude="kind")
+    kinds = dict(conn.execute(
+        f"SELECT kind, COUNT(*) FROM files WHERE {cond} GROUP BY kind", args))
+    categories = dict(conn.execute(
+        f"SELECT category, COUNT(*) FROM files WHERE {cond} "
+        f"AND category IS NOT NULL GROUP BY category", args))
+    cond, args = _build_where(params, exclude="source")
+    sources = dict(conn.execute(
+        f"SELECT source, COUNT(*) FROM files WHERE {cond} GROUP BY source", args))
+    cond, args = _build_where(params, exclude="machine")
+    devices = [{"value": r[0], "label": r[1] or "Unknown machine", "count": r[2]}
+               for r in conn.execute(
+        f"SELECT device_id, device_label, COUNT(*) FROM files "
+        f"WHERE {cond} GROUP BY device_id, device_label ORDER BY device_label", args)]
+    cond, args = _build_where(params, exclude="year")
+    years = [{"value": r[0], "count": r[1]} for r in conn.execute(
+        f"SELECT substr(modified,1,4) y, COUNT(*) FROM files "
+        f"WHERE {cond} AND modified != '' GROUP BY y ORDER BY y DESC", args)]
+    conn.close()
+    return {"kinds": kinds, "categories": categories,
+            "sources": sources, "devices": devices, "years": years}
 
 
 def api_search(params):
-    conn = db()
+    sort = SORT_COLUMNS.get(params.get("sort", [""])[0], SORT_COLUMNS["modified"])
     try:
-        return iq.search(conn, _search_filters(params),
-                         params.get("sort", [""])[0], _page(params), PAGE_SIZE)
-    finally:
-        conn.close()
+        page = max(0, int(params.get("page", ["0"])[0]))
+    except ValueError:
+        page = 0
+    cond, args = _build_where(params)
+
+    conn = db()
+    total = conn.execute(f"SELECT COUNT(*) FROM files WHERE {cond}", args).fetchone()[0]
+    rows = [dict(r) for r in conn.execute(
+        f"SELECT id, source, device_id, device_label, path, name, ext, kind, size, modified, "
+        f"category, marked_delete "
+        f"FROM files WHERE {cond} ORDER BY {sort} LIMIT ? OFFSET ?",
+        args + [PAGE_SIZE, page * PAGE_SIZE])]
+    conn.close()
+    return {"total": total, "rows": rows, "page": page, "page_size": PAGE_SIZE}
 
 
 # --- rename suggestions ---------------------------------------------------------
@@ -1995,11 +2082,14 @@ def api_rename(body):
     elif row["source"] in ("gdrive", "qnap"):
         old_rel = row["path"]
         new_rel = str(PurePosixPath(old_rel).with_name(new_name))
-        try:
-            mi.rclone.move(row["source"], old_rel, new_rel)
-        except mi.RcloneError as exc:
+        proc = subprocess.run(
+            [mi.find_rclone(), "moveto",
+             mi.rclone_full_path(row["source"], old_rel),
+             mi.rclone_full_path(row["source"], new_rel)],
+            capture_output=True, text=True, encoding="utf-8")
+        if proc.returncode != 0:
             label = "Google Drive" if row["source"] == "gdrive" else "QNAP"
-            raise ValueError(f"{label} rename failed: {exc.stderr[:300]}")
+            raise ValueError(f"{label} rename failed: {proc.stderr.strip()[:300]}")
         new_path = new_rel
 
     new_ext = new_name.rsplit(".", 1)[-1].lower() if "." in new_name else ""
@@ -2013,51 +2103,261 @@ def api_rename(body):
 
 # --- duplicates -----------------------------------------------------------------
 
-def _dup_filters_from(params) -> iq.DupFilters:
-    try:
-        min_size = int(params.get("min_size", ["0"])[0])
-    except ValueError:
-        min_size = 0
-    return iq.DupFilters(
-        q=params.get("q", [""])[0].strip(),
-        source=params.get("source", [""])[0],
-        min_size=min_size,
-        possible=params.get("possible", [""])[0] == "1",
-    )
+DUP_MODES = {
+    # "name COLLATE NOCASE" groups case-insensitively like LOWER(name) but can
+    # use the idx_files_name_lower index, where LOWER(name) cannot.
+    "name": "name COLLATE NOCASE",
+    "meta": "meta_fingerprint",
+    "hash": "content_hash",
+}
 
 
-def _limit(params) -> int:
-    try:
-        return min(100, max(1, int(params.get("limit", ["25"])[0])))
-    except ValueError:
-        return 25
+def _file_brief(row) -> dict:
+    return {
+        "id": row["id"], "source": row["source"], "name": row["name"],
+        "path": row["path"], "size": row["size"], "modified": row["modified"],
+        "content_hash": row["content_hash"], "meta_fingerprint": row["meta_fingerprint"],
+        "possible_dupe": row["possible_dupe"], "kind": row["kind"],
+    }
 
 
 def api_duplicates_summary():
     conn = db()
-    try:
-        return iq.duplicates_summary(conn)
-    finally:
-        conn.close()
+    mi.backfill_meta_fingerprints(conn)
+    total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    hashed = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL AND content_hash != ''"
+    ).fetchone()[0]
+    groups = conn.execute(
+        "SELECT COUNT(*) FROM ("
+        "SELECT content_hash FROM files WHERE content_hash IS NOT NULL AND content_hash != '' "
+        "GROUP BY content_hash HAVING COUNT(*) > 1)"
+    ).fetchone()[0]
+    possible = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE possible_dupe = 1").fetchone()[0]
+    conn.close()
+    return {"total": total, "hashed": hashed, "groups": groups, "possible": possible}
+
+
+REPORT_BUCKETS = [
+    ("≥ 1 GB", 1_000_000_000, None),
+    ("100 MB – 1 GB", 100_000_000, 1_000_000_000),
+    ("10 – 100 MB", 10_000_000, 100_000_000),
+    ("< 10 MB", 0, 10_000_000),
+]
 
 
 def api_duplicates_report(params):
+    """Exact-content-hash duplicate breakdown, optionally scoped to one source.
+    Reports group/redundant-copy counts, reclaimable bytes, size buckets, a
+    per-source rollup, and the biggest groups by reclaimable space."""
+    source = params.get("source", [""])[0]
+    if source not in ("local", "onedrive", "gdrive", "qnap"):
+        source = ""
     conn = db()
+    hashed_clause = "content_hash IS NOT NULL AND content_hash != ''"
+    scope_clause = hashed_clause + (" AND source = ?" if source else "")
+    scope_args = [source] if source else []
+
+    files, ibytes = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(size),0) FROM files WHERE "
+        + (("source = ?") if source else "1=1"), scope_args).fetchone()
+    hashed = conn.execute(
+        f"SELECT COUNT(*) FROM files WHERE {scope_clause}", scope_args).fetchone()[0]
+
+    # Duplicate groups within scope (cross-source when no source is selected).
+    rows = conn.execute(
+        f"SELECT content_hash h, COUNT(*) c, MAX(size) sz FROM files "
+        f"WHERE {scope_clause} GROUP BY content_hash HAVING c > 1", scope_args).fetchall()
+
+    groups = len(rows)
+    redundant = sum(r["c"] - 1 for r in rows)
+    reclaim = sum((r["c"] - 1) * (r["sz"] or 0) for r in rows)
+
+    buckets = []
+    for label, lo, hi in REPORT_BUCKETS:
+        sel = [r for r in rows
+               if (r["sz"] or 0) >= lo and (hi is None or (r["sz"] or 0) < hi)]
+        buckets.append({
+            "label": label,
+            "groups": len(sel),
+            "copies": sum(r["c"] - 1 for r in sel),
+            "bytes": sum((r["c"] - 1) * (r["sz"] or 0) for r in sel),
+        })
+
+    top = sorted(rows, key=lambda r: (r["c"] - 1) * (r["sz"] or 0), reverse=True)[:25]
+    top_out = []
+    for r in top:
+        sample = conn.execute(
+            "SELECT id, name, path, source FROM files WHERE content_hash = ?"
+            + (" AND source = ?" if source else "") + " ORDER BY source, path LIMIT 1",
+            [r["h"]] + scope_args).fetchone()
+        if not sample:
+            continue
+        top_out.append({
+            "id": sample["id"], "name": sample["name"], "path": sample["path"],
+            "source": sample["source"], "count": r["c"], "each": r["sz"] or 0,
+            "waste": (r["c"] - 1) * (r["sz"] or 0),
+        })
+
+    # Per-source rollup: duplicate groups *within* each source.
+    per_rows = conn.execute(
+        f"SELECT source, content_hash, COUNT(*) c, MAX(size) sz FROM files "
+        f"WHERE {hashed_clause} GROUP BY source, content_hash HAVING c > 1").fetchall()
+    roll = {}
+    for r in per_rows:
+        d = roll.setdefault(r["source"], {"groups": 0, "copies": 0, "reclaim": 0})
+        d["groups"] += 1
+        d["copies"] += r["c"] - 1
+        d["reclaim"] += (r["c"] - 1) * (r["sz"] or 0)
+    counts = dict(conn.execute(
+        f"SELECT source, COUNT(*) FROM files WHERE {hashed_clause} GROUP BY source"))
+    per_source = []
+    for src in ("local", "onedrive", "gdrive", "qnap"):
+        if src not in counts and src not in roll:
+            continue
+        d = roll.get(src, {"groups": 0, "copies": 0, "reclaim": 0})
+        per_source.append({"source": src, "files": counts.get(src, 0), **d})
+
+    conn.close()
+    return {
+        "scope": source or "all", "files": files, "ibytes": ibytes, "hashed": hashed,
+        "groups": groups, "redundant": redundant, "reclaim": reclaim,
+        "buckets": buckets, "top": top_out, "per_source": per_source,
+    }
+
+
+def _dup_filters(params):
+    """Build extra WHERE conditions for the duplicate-group queries from the
+    filter params. Returns (sql_fragment, args); the fragment begins with
+    ' AND ...' so it can be appended to an existing WHERE."""
+    where, args = [], []
+    q = params.get("q", [""])[0].strip()
+    source = params.get("source", [""])[0]
+    possible = params.get("possible", [""])[0]
     try:
-        return iq.duplicates_report(conn, params.get("source", [""])[0])
-    finally:
-        conn.close()
+        min_size = int(params.get("min_size", ["0"])[0])
+    except ValueError:
+        min_size = 0
+    if q:
+        where.append("(name LIKE ? OR path LIKE ?)")
+        args += [f"%{q}%", f"%{q}%"]
+    if source in ("local", "onedrive", "gdrive", "qnap"):
+        where.append("source = ?")
+        args.append(source)
+    if min_size > 0:
+        where.append("size >= ?")
+        args.append(min_size)
+    if possible == "1":
+        where.append("possible_dupe = 1")
+    frag = ("".join(f" AND {c}" for c in where))
+    return frag, args
 
 
 def api_duplicates(params):
-    conn = db()
+    mode = params.get("mode", ["name"])[0]
+    if mode not in DUP_MODES:
+        mode = "name"
+    key_expr = DUP_MODES[mode]
     try:
-        return iq.duplicate_groups(
-            conn, params.get("mode", ["name"])[0], _dup_filters_from(params),
-            _page(params), _limit(params),
-            params.get("file_id", [""])[0].strip(), GROUP_FILE_CAP)
-    finally:
+        page = max(0, int(params.get("page", ["0"])[0]))
+    except ValueError:
+        page = 0
+    try:
+        limit = min(100, max(1, int(params.get("limit", ["25"])[0])))
+    except ValueError:
+        limit = 25
+    file_id = params.get("file_id", [""])[0].strip()
+
+    conn = db()
+    if mode == "meta":
+        mi.backfill_meta_fingerprints(conn)
+    anchor = None
+
+    if file_id:
+        row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+        if not row:
+            conn.close()
+            return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit}
+        anchor = _file_brief(row)
+        if mode == "name":
+            key_val = row["name"].lower()
+            key_filter = f"{key_expr} = ?"
+            key_args = [key_val]
+        elif mode == "meta":
+            if not row["meta_fingerprint"]:
+                conn.close()
+                return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit, "anchor": anchor}
+            key_val = row["meta_fingerprint"]
+            key_filter = f"{key_expr} = ?"
+            key_args = [key_val]
+        else:
+            if not row["content_hash"]:
+                conn.close()
+                return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit, "anchor": anchor}
+            key_val = row["content_hash"]
+            key_filter = f"{key_expr} = ?"
+            key_args = [key_val]
+        files = [dict(r) for r in conn.execute(
+            f"SELECT * FROM files WHERE {key_filter} ORDER BY source, name", key_args)]
         conn.close()
+        if len(files) < 2:
+            return {"groups": [], "total_groups": 0, "page": 0, "page_size": limit, "anchor": anchor}
+        label = key_val if mode != "name" else row["name"]
+        return {
+            "groups": [{
+                "key": key_val, "label": label, "count": len(files),
+                "files": [_file_brief(r) for r in files[:GROUP_FILE_CAP]],
+            }],
+            "total_groups": 1,
+            "page": 0,
+            "page_size": limit,
+            "anchor": anchor,
+        }
+
+    null_guard = f"{key_expr} IS NOT NULL AND {key_expr} != ''"
+    if mode == "name":
+        null_guard = f"{key_expr} IS NOT NULL"
+
+    frag, frag_args = _dup_filters(params)
+    where_full = null_guard + frag
+
+    total_groups = conn.execute(
+        f"SELECT COUNT(*) FROM ("
+        f"SELECT {key_expr} k FROM files WHERE {where_full} "
+        f"GROUP BY k HAVING COUNT(*) > 1)", frag_args
+    ).fetchone()[0]
+
+    key_rows = conn.execute(
+        f"SELECT k, c FROM ("
+        f"SELECT {key_expr} k, COUNT(*) c FROM files WHERE {where_full} "
+        f"GROUP BY k HAVING c > 1) ORDER BY c DESC, k LIMIT ? OFFSET ?",
+        frag_args + [limit, page * limit]).fetchall()
+
+    groups = []
+    for key_val, count in key_rows:
+        # Fetch only the capped slice, not every row in the group; the true
+        # total comes from the grouped count above. Groups can be huge
+        # (thousands of identical files), so this avoids a heavy fetchall and
+        # the resulting oversized payload.
+        rows = conn.execute(
+            f"SELECT * FROM files WHERE {key_expr} = ?{frag} ORDER BY source, name LIMIT ?",
+            [key_val] + frag_args + [GROUP_FILE_CAP]).fetchall()
+        label = rows[0]["name"] if (mode == "name" and rows) else key_val
+        groups.append({
+            "key": key_val,
+            "label": label,
+            "count": count,
+            "files": [_file_brief(r) for r in rows],
+        })
+    conn.close()
+    return {
+        "groups": groups,
+        "total_groups": total_groups,
+        "page": page,
+        "page_size": limit,
+        "anchor": anchor,
+    }
 
 
 def api_scan_start(body):
@@ -2291,79 +2591,6 @@ def api_organize_undo(body):
     return {"ok": True}
 
 
-# --- request routing ----------------------------------------------------------
-# One table per HTTP method maps a path to a handler. The dispatcher (do_GET /
-# do_POST) handles session setup, body parsing, 404s, and — for POST — a single
-# error-wrapping policy per route, so handlers don't repeat try/except boilerplate.
-
-_HTML = "text/html; charset=utf-8"
-
-# POST error policies (the 2nd item of each _POST_ROUTES entry):
-_ERR_VALUE = "__value__"           # ValueError -> {"error": str}; others propagate
-_ERR_UNEXPECTED = "__unexpected__"  # ValueError -> str; any other -> "Unexpected error: ..."
-# any other non-empty string  -> a prefix: every exception -> "{prefix}: {exc}"
-# None                        -> no wrapping (handler returns its own {"ok": False})
-
-
-def _wrap_post_error(exc: Exception, policy):
-    if policy == _ERR_VALUE:
-        if isinstance(exc, ValueError):
-            return {"ok": False, "error": str(exc)}
-        raise exc
-    if policy == _ERR_UNEXPECTED:
-        if isinstance(exc, ValueError):
-            return {"ok": False, "error": str(exc)}
-        return {"ok": False, "error": f"Unexpected error: {exc}"}
-    if isinstance(policy, str):     # prefix policy wraps every exception
-        return {"ok": False, "error": f"{policy}: {exc}"}
-    raise exc                       # policy is None -> no wrapping
-
-
-_GET_ROUTES = {
-    "/":                       lambda s, u: s._send(200, render_page(LANDING_HTML), _HTML),
-    "/media":                  lambda s, u: s._send(200, render_app("media"), _HTML),
-    "/documents":              lambda s, u: s._send(200, render_app("documents"), _HTML),
-    "/duplicates":             lambda s, u: s._send(200, render_page(DUPS_HTML), _HTML),
-    "/media-org":              lambda s, u: s._send(200, render_page(MEDIAORG_HTML), _HTML),
-    # The report is now the Overview tab of /duplicates; keep old links working.
-    "/duplicates/report":      lambda s, u: s._redirect("/duplicates?view=overview"),
-    "/api/file":               lambda s, u: s._serve_file(parse_qs(u.query)),
-    "/api/stats":              lambda s, u: s._json(api_stats(parse_qs(u.query))),
-    "/api/search":             lambda s, u: s._json(api_search(parse_qs(u.query))),
-    "/api/facets":             lambda s, u: s._json(api_facets(parse_qs(u.query))),
-    "/api/suggest":            lambda s, u: s._json(api_suggest(parse_qs(u.query))),
-    "/api/duplicates":         lambda s, u: s._json(api_duplicates(parse_qs(u.query))),
-    "/api/duplicates/report":  lambda s, u: s._json(api_duplicates_report(parse_qs(u.query))),
-    "/api/duplicates/summary": lambda s, u: s._json(api_duplicates_summary()),
-    "/api/scan/status":        lambda s, u: s._json(api_scan_status()),
-    "/api/delete/status":      lambda s, u: s._json(api_delete_status()),
-    "/api/trash":              lambda s, u: s._json(api_trash(s.session_id)),
-    "/api/organize/preview":   lambda s, u: s._json(api_organize_preview(parse_qs(u.query))),
-    "/api/organize/status":    lambda s, u: s._json(api_organize_status()),
-    "/api/organize/batches":   lambda s, u: s._json(api_organize_batches()),
-}
-
-_POST_ROUTES = {
-    "/api/scan/start":      (lambda s, b: api_scan_start(b), None),
-    "/api/scan/cancel":     (lambda s, b: api_scan_cancel(), None),
-    "/api/delete/cancel":   (lambda s, b: api_delete_cancel(), None),
-    "/api/organize/start":  (lambda s, b: api_organize_start(b), None),
-    "/api/organize/cancel": (lambda s, b: api_organize_cancel(), None),
-    "/api/organize/undo":   (lambda s, b: api_organize_undo(b), None),
-    "/api/trash/empty":     (lambda s, b: api_trash_empty(s.session_id), None),
-    "/api/mark-delete":     (lambda s, b: api_mark_delete(b, s.session_id), _ERR_VALUE),
-    "/api/delete":          (lambda s, b: api_delete_file(b, s.session_id), _ERR_VALUE),
-    "/api/delete-batch":    (lambda s, b: api_delete_batch(b, s.session_id), _ERR_VALUE),
-    "/api/restore":         (lambda s, b: api_restore_file(b, s.session_id), _ERR_VALUE),
-    "/api/move":            (lambda s, b: api_move_file(b, s.session_id), _ERR_VALUE),
-    "/api/ingest":          (lambda s, b: api_ingest(b, s._token_ok()), "Ingest failed"),
-    "/api/reveal":          (lambda s, b: api_reveal(b), "Open folder failed"),
-    "/api/prune-missing":   (lambda s, b: api_prune_missing(), "Prune failed"),
-    "/api/rename":          (lambda s, b: api_rename(b), _ERR_UNEXPECTED),
-    "/api/reclassify":      (lambda s, b: api_reclassify(b), _ERR_UNEXPECTED),
-}
-
-
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     session_id = ""
@@ -2372,14 +2599,6 @@ class Handler(BaseHTTPRequestHandler):
     def _ensure_session(self):
         self.session_id, self.session_is_new = file_ops.parse_session_id(
             self.headers.get("Cookie"))
-
-    def _token_ok(self) -> bool:
-        expected = os.environ.get("INDEXHUB_TOKEN")
-        return (not expected) or (self.headers.get("X-IndexHub-Token") == expected)
-
-    def _read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(length) or b"{}") if length else {}
 
     def _maybe_set_session_cookie(self):
         if self.session_is_new:
@@ -2391,30 +2610,142 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._ensure_session()
         url = urlparse(self.path)
-        route = _GET_ROUTES.get(url.path)
-        if route is None:
+        if url.path == "/":
+            self._send(200, render_page(LANDING_HTML), "text/html; charset=utf-8")
+        elif url.path in ("/media", "/documents"):
+            self._send(200, render_app(url.path[1:]), "text/html; charset=utf-8")
+        elif url.path == "/duplicates":
+            self._send(200, render_page(DUPS_HTML), "text/html; charset=utf-8")
+        elif url.path == "/duplicates/report":
+            # The report is now the Overview tab of /duplicates; keep old
+            # bookmarks and deep-links working.
+            self._redirect("/duplicates?view=overview")
+        elif url.path == "/api/duplicates/report":
+            self._json(api_duplicates_report(parse_qs(url.query)))
+        elif url.path == "/api/stats":
+            self._json(api_stats(parse_qs(url.query)))
+        elif url.path == "/api/search":
+            self._json(api_search(parse_qs(url.query)))
+        elif url.path == "/api/facets":
+            self._json(api_facets(parse_qs(url.query)))
+        elif url.path == "/api/suggest":
+            self._json(api_suggest(parse_qs(url.query)))
+        elif url.path == "/api/file":
+            self._serve_file(parse_qs(url.query))
+        elif url.path == "/api/duplicates":
+            self._json(api_duplicates(parse_qs(url.query)))
+        elif url.path == "/api/duplicates/summary":
+            self._json(api_duplicates_summary())
+        elif url.path == "/api/scan/status":
+            self._json(api_scan_status())
+        elif url.path == "/api/delete/status":
+            self._json(api_delete_status())
+        elif url.path == "/api/trash":
+            self._json(api_trash(self.session_id))
+        elif url.path == "/media-org":
+            self._send(200, render_page(MEDIAORG_HTML), "text/html; charset=utf-8")
+        elif url.path == "/api/organize/preview":
+            self._json(api_organize_preview(parse_qs(url.query)))
+        elif url.path == "/api/organize/status":
+            self._json(api_organize_status())
+        elif url.path == "/api/organize/batches":
+            self._json(api_organize_batches())
+        else:
             self._send(404, b"not found", "text/plain")
-            return
-        route(self, url)
 
     def do_POST(self):
         self._ensure_session()
         url = urlparse(self.path)
         try:
-            body = self._read_json_body()
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}") if length else {}
         except json.JSONDecodeError:
             self._json({"ok": False, "error": "Invalid JSON body"})
             return
-        route = _POST_ROUTES.get(url.path)
-        if route is None:
+
+        if url.path == "/api/scan/start":
+            self._json(api_scan_start(body))
+            return
+        if url.path == "/api/scan/cancel":
+            self._json(api_scan_cancel())
+            return
+        if url.path == "/api/delete/cancel":
+            self._json(api_delete_cancel())
+            return
+        if url.path == "/api/organize/start":
+            self._json(api_organize_start(body))
+            return
+        if url.path == "/api/organize/cancel":
+            self._json(api_organize_cancel())
+            return
+        if url.path == "/api/organize/undo":
+            self._json(api_organize_undo(body))
+            return
+        if url.path == "/api/mark-delete":
+            try:
+                self._json(api_mark_delete(body, self.session_id))
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/delete":
+            try:
+                self._json(api_delete_file(body, self.session_id))
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/delete-batch":
+            try:
+                self._json(api_delete_batch(body, self.session_id))
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/ingest":
+            expected = os.environ.get("INDEXHUB_TOKEN")
+            token_ok = (not expected) or (self.headers.get("X-IndexHub-Token") == expected)
+            try:
+                self._json(api_ingest(body, token_ok))
+            except Exception as exc:
+                self._json({"ok": False, "error": f"Ingest failed: {exc}"})
+            return
+        if url.path == "/api/restore":
+            try:
+                self._json(api_restore_file(body, self.session_id))
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/trash/empty":
+            self._json(api_trash_empty(self.session_id))
+            return
+        if url.path == "/api/move":
+            try:
+                self._json(api_move_file(body, self.session_id))
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)})
+            return
+        if url.path == "/api/reveal":
+            try:
+                self._json(api_reveal(body))
+            except Exception as exc:
+                self._json({"ok": False, "error": f"Open folder failed: {exc}"})
+            return
+        if url.path == "/api/prune-missing":
+            try:
+                self._json(api_prune_missing())
+            except Exception as exc:
+                self._json({"ok": False, "error": f"Prune failed: {exc}"})
+            return
+        if url.path not in ("/api/rename", "/api/reclassify"):
             self._send(404, b"not found", "text/plain")
             return
-        handler, policy = route
         try:
-            result = handler(self, body)
-        except Exception as exc:
-            result = _wrap_post_error(exc, policy)
-        self._json(result)
+            if url.path == "/api/rename":
+                self._json(api_rename(body))
+            else:
+                self._json(api_reclassify(body))
+        except ValueError as exc:
+            self._json({"ok": False, "error": str(exc)})
+        except Exception as exc:  # surface unexpected errors to the UI
+            self._json({"ok": False, "error": f"Unexpected error: {exc}"})
 
     # -- file streaming ----------------------------------------------------------
 
@@ -2474,7 +2805,9 @@ class Handler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
     def _stream_remote(self, row, ctype):
-        proc = mi.rclone.cat_popen(row["source"], row["path"])
+        proc = subprocess.Popen(
+            [mi.find_rclone(), "cat", mi.rclone_full_path(row["source"], row["path"])],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
             self.send_response(200)
             self.send_header("Content-Type", ctype)
