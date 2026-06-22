@@ -5,3 +5,5 @@ foodieness_cleanup_manifest.json
 qnap_config.json
 .trash/
 __pycache__/
+server.log
+server.err.log
