@@ -879,7 +879,7 @@ document.getElementById("scanCancel").onclick = async () => {
   refreshScanStatus();
 };
 document.getElementById("pruneMissing").onclick = async () => {
-  if (!confirm("Remove index entries for local / OneDrive files that no longer exist on disk?\n\nRemote files (QNAP, Google Drive) are not checked.")) return;
+  if (!confirm("Remove index entries for local / OneDrive files that no longer exist on disk?\\n\\nRemote files (QNAP, Google Drive) are not checked.")) return;
   const btn = document.getElementById("pruneMissing");
   const status = document.getElementById("scanStatus");
   btn.disabled = true;
